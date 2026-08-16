@@ -1,0 +1,14 @@
+# Python 3.11+ requis (zarr>=3 en depend).
+# torch/torchvision NE SONT PAS dans ce fichier -- a installer separement,
+# voir SETUP.md (l'index a utiliser depend du GPU/OS de la machine).
+
+numpy==2.5.2
+scipy==1.18.0
+scikit-image==0.26.0
+pandas==3.0.5
+networkx==3.6.1
+tqdm==4.70.0
+zarr==3.3.0
+geff==1.3.0.1.2
+laptrack==0.17.1
+matplotlib==3.11.1
