@@ -19,16 +19,34 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ROOT = PROJECT_ROOT  # alias court, utilise par convention dans les autres scripts
 
-_KAGGLE_ROOT = Path("/kaggle/input/biohub-cell-tracking-during-development")
+# quand la competition est ajoutee via "+ Add Input" dans un notebook Kaggle,
+# elle est montee sous /kaggle/input/competitions/<slug-de-la-competition>
+_KAGGLE_COMPETITIONS_DIR = Path("/kaggle/input/competitions")
+_KAGGLE_ROOT = _KAGGLE_COMPETITIONS_DIR / "biohub-cell-tracking-during-development"
 _LOCAL_DEFAULT_ROOT = Path("D:/biohub-cell-tracking-during-development")
+
+
+def _find_kaggle_root():
+    """Cherche le dossier de la competition sous /kaggle/input/competitions/.
+    Le nom exact du sous-dossier peut varier legerement -- on essaie le nom
+    attendu en premier, puis on retombe sur le premier dossier contenant
+    "biohub" trouve, pour rester robuste a une legere difference de nom."""
+    if _KAGGLE_ROOT.exists():
+        return _KAGGLE_ROOT
+    if _KAGGLE_COMPETITIONS_DIR.exists():
+        for entry in _KAGGLE_COMPETITIONS_DIR.iterdir():
+            if entry.is_dir() and "biohub" in entry.name.lower():
+                return entry
+    return None
 
 
 def _resolve_data_root() -> Path:
     env = os.environ.get("CELLTRACK_DATA_DIR")
     if env:
         return Path(env)
-    if _KAGGLE_ROOT.exists():
-        return _KAGGLE_ROOT
+    kaggle_root = _find_kaggle_root()
+    if kaggle_root is not None:
+        return kaggle_root
     return _LOCAL_DEFAULT_ROOT
 
 
