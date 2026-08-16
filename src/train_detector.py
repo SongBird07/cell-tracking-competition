@@ -446,19 +446,27 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses)) if val_losses else float("nan")
         elapsed = time.time() - t0
-        print(f"epoch {epoch + 1}/{start_epoch + max_epochs}  train_loss={train_loss:.5f}  val_loss={val_loss:.5f}  ({elapsed:.1f}s)")
+        if history:
+            prev_best_epoch = max((h["epoch"] for h in history if h["val_loss"] == best_val_loss), default=None)
+            best_info = f"[meilleur actuel: epoque {prev_best_epoch}, val_loss={best_val_loss:.5f}]"
+        else:
+            best_info = "[premiere epoque, pas encore de meilleur]"
+        print(f"epoch {epoch + 1}/{start_epoch + max_epochs}  train_loss={train_loss:.5f}  val_loss={val_loss:.5f}  "
+              f"({elapsed:.1f}s)  {best_info}")
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "seconds": elapsed})
 
         # checkpoint "dernier etat" (toujours ecrase, pour reprise apres crash)
         torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss}, latest_path)
 
         if val_loss < best_val_loss - min_delta:
+            improvement_str = f"amelioration de {best_val_loss - val_loss:.5f}" if best_val_loss != float("inf") else "premier resultat"
             best_val_loss = val_loss
             epochs_without_improvement = 0
             torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss}, weights_path)
-            print(f"  -> nouveau meilleur checkpoint sauvegarde: {weights_path}")
+            print(f"  -> NOUVEAU MEILLEUR ({improvement_str}), checkpoint sauvegarde: {weights_path}")
         else:
             epochs_without_improvement += 1
+            print(f"  -> pas d'amelioration ({epochs_without_improvement}/{patience} avant arret automatique)")
 
         log_path.write_text(json.dumps(history, indent=2))
 
