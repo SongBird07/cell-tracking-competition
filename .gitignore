@@ -1,0 +1,10 @@
+# environnements virtuels (volumineux, specifiques a la machine)
+.venv/
+.venv314/
+
+# cache Python
+__pycache__/
+*.pyc
+
+# dossiers scratch temporaires
+data/_scratch_*/
