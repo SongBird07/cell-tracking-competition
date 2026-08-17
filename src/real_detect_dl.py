@@ -39,13 +39,25 @@ def _tta_axes_list(tta):
     raise ValueError(f"tta invalide: {tta!r} (attendu None, 'light' ou 'full')")
 
 
+_ADDITIVE_KEY_PREFIXES = ("aux_heads.", "distance_head.")
+
+
 def load_model(model_name="heatmap_unet", device=None):
     """Charge (avec cache) le checkpoint `weights/<model_name>.pt`.
 
-    Tolerant aux checkpoints entraines avec deep_supervision=True : les poids
-    des `aux_heads.*` (non utilises a l'inference, seule la sortie
-    principale sert) sont simplement ignores via strict=False plutot que de
-    faire planter le chargement.
+    Tolerant aux checkpoints entraines avec deep_supervision=True et/ou
+    predict_distance=True : les poids `aux_heads.*`/`distance_head.*` (non
+    utilises a l'inference, seule la sortie principale sert) sont simplement
+    ignores via strict=False plutot que de faire planter le chargement.
+
+    norm_type EST relu depuis le checkpoint (train_detector.py le sauvegarde
+    a chaque save) et utilise pour reconstruire l'architecture EXACTE avant
+    de charger les poids -- indispensable pour un checkpoint "groupnorm" :
+    contrairement a aux_heads/distance_head, ce n'est pas un ajout purement
+    additif (BatchNorm accumule des statistiques que GroupNorm n'a pas), un
+    mauvais norm_type chargerait silencieusement des poids sans les vraies
+    statistiques de normalisation -- predictions fausses SANS erreur. Voir
+    l'avertissement en tete de dl_model.py.
     """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     cache_key = (model_name, device)
@@ -56,10 +68,12 @@ def load_model(model_name="heatmap_unet", device=None):
                 f"Aucun checkpoint entraine trouve a {weights_path}.\n"
                 f"  -> lance d'abord: python src/train_detector.py"
             )
-        model = HeatmapUNet3D(levels=DETECTOR_LEVELS).to(device)
         ckpt = torch.load(weights_path, map_location=device, weights_only=False)
+        norm_type = ckpt.get("norm_type", "batch")
+        model = HeatmapUNet3D(levels=DETECTOR_LEVELS, norm_type=norm_type).to(device)
         missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
-        unexpected = [k for k in unexpected if not k.startswith("aux_heads.")]
+        missing = [k for k in missing if not k.startswith(_ADDITIVE_KEY_PREFIXES)]
+        unexpected = [k for k in unexpected if not k.startswith(_ADDITIVE_KEY_PREFIXES)]
         if missing or unexpected:
             print(f"  (avertissement chargement '{model_name}': missing={missing}, unexpected={unexpected})")
         model.eval()

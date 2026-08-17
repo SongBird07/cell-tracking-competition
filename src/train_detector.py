@@ -28,13 +28,17 @@ Ce que le script fait tout seul, sans intervention manuelle :
 
 Techniques anti-plateau actives par defaut : weight_decay decouple, gradient
 clipping, augmentation avancee (flips/rotation/gamma/deformation elastique/
-bruit de Poisson), Stochastic Weight Averaging en fin d'entrainement, dropout
-au bottleneck, supervision profonde (pertes auxiliaires), et mining
-d'exemples difficiles (re-pondere le tirage vers les points les plus mal
-predits). Desactivables individuellement (voir --help). En option : LR
-schedule "cosine" (redemarrages periodiques, --lr-schedule cosine) et
-selection periodique du meilleur checkpoint sur la VRAIE metrique de
-competition plutot que sur val_loss seul (--real-score-every).
+bruit de Poisson), Stochastic Weight Averaging en fin d'entrainement, EMA
+continu des poids (weights/<nom>_ema.pt), dropout au bottleneck, supervision
+profonde (pertes auxiliaires), tache auxiliaire de distance-transform, perte
+focale type CenterNet (--loss-type), mining d'exemples difficiles (re-pondere
+le tirage vers les points les plus mal predits), et warmup du LR en debut
+d'entrainement. Desactivables individuellement (voir --help). En option : LR
+schedule "cosine" (redemarrages periodiques, --lr-schedule cosine),
+GroupNorm a la place de BatchNorm (--norm-type groupnorm), optimiseur SAM
+(--use-sam, cherche des minima plats, cout x2), et selection periodique du
+meilleur checkpoint sur la VRAIE metrique de competition plutot que sur
+val_loss seul (--real-score-every).
 
 --model-name permet d'entrainer plusieurs modeles independants (avec --seed
 different) pour constituer un ENSEMBLE a l'inference -- voir
@@ -56,7 +60,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from scipy.ndimage import gaussian_filter, map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates, distance_transform_edt
 
 from real_io import open_zarr_volume
 from dl_model import HeatmapUNet3D, DETECTOR_LEVELS
@@ -106,7 +110,71 @@ def move_optimizer_state(optimizer, device):
                 state[k] = v.to(device)
 
 
-def _cpu_shadow_step(model_cpu, patch_cpu, target_cpu, result_holder):
+class SAM(torch.optim.Optimizer):
+    """Sharpness-Aware Minimization (Foret et al., 2021) : au lieu de suivre
+    le gradient au point actuel, cherche le PIRE point dans un voisinage de
+    rayon `rho` (first_step, monte dans la direction du gradient) puis
+    applique le pas d'optimisation reel a partir du gradient calcule LA-BAS
+    (second_step) -- pousse la recherche vers des minima "plats" (peu
+    sensibles a une petite perturbation des poids), qui generalisent mieux
+    et sont moins susceptibles de rester coinces dans un plateau etroit
+    qu'un minimum pointu quelconque. Cout : deux passes forward+backward par
+    step au lieu d'une seule.
+
+    Usage (voir run_training) : deux forward/backward suivis de first_step()
+    puis second_step() -- PAS un simple optimizer.step()."""
+
+    def __init__(self, params, base_optimizer_cls, rho=0.05, **base_kwargs):
+        defaults = dict(rho=rho, **base_kwargs)
+        super().__init__(params, defaults)
+        self.base_optimizer = base_optimizer_cls(self.param_groups, **base_kwargs)
+        self.param_groups = self.base_optimizer.param_groups
+
+    @torch.no_grad()
+    def first_step(self, zero_grad=False):
+        grads = [p.grad for group in self.param_groups for p in group["params"] if p.grad is not None]
+        grad_norm = torch.norm(torch.stack([g.norm(p=2) for g in grads])) if grads else torch.tensor(0.0)
+        for group in self.param_groups:
+            scale = group["rho"] / (grad_norm + 1e-12)
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                e_w = p.grad * scale
+                p.add_(e_w)
+                self.state[p]["e_w"] = e_w
+        if zero_grad:
+            self.zero_grad()
+
+    @torch.no_grad()
+    def second_step(self, zero_grad=False):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None or "e_w" not in self.state[p]:
+                    continue
+                p.sub_(self.state[p]["e_w"])  # revient au point de depart avant le pas reel
+        self.base_optimizer.step()
+        if zero_grad:
+            self.zero_grad()
+
+
+def _update_ema(ema_model, model, decay):
+    """Moyenne mobile exponentielle CONTINUE des poids, mise a jour a chaque
+    step (contrairement a SWA, qui ne moyenne que les N derniers etats en fin
+    d'entrainement) -- souvent plus stable, technique standard dans de
+    nombreux pipelines de detection modernes (YOLO, etc.). Les buffers
+    entiers (ex: num_batches_tracked) sont simplement copies, seuls les
+    tenseurs flottants sont moyennes."""
+    with torch.no_grad():
+        ema_sd = ema_model.state_dict()
+        for k, v in model.state_dict().items():
+            ema_v = ema_sd[k]
+            if ema_v.dtype.is_floating_point:
+                ema_v.mul_(decay).add_(v, alpha=1 - decay)
+            else:
+                ema_v.copy_(v)
+
+
+def _cpu_shadow_step(model_cpu, patch_cpu, target_cpu, result_holder, aux_weight=0.3, loss_fn=None, dist_weight=0.2):
     """Calcule forward+backward sur CPU pour la portion parallele du batch,
     dans un thread separe pendant que le GPU calcule sa propre portion sur le
     thread principal EN MEME TEMPS (pas en alternance). PyTorch relache le
@@ -114,7 +182,7 @@ def _cpu_shadow_step(model_cpu, patch_cpu, target_cpu, result_holder):
     progressent reellement en parallele."""
     model_cpu.zero_grad()
     pred = model_cpu(patch_cpu)
-    loss = compute_loss_with_aux(model_cpu, pred, target_cpu)
+    loss = compute_loss_with_aux(model_cpu, pred, target_cpu, aux_weight, loss_fn=loss_fn, dist_weight=dist_weight)
     loss.backward()
     result_holder["loss"] = loss.item()
 
@@ -157,9 +225,17 @@ class SparsePointPatchDataset(Dataset):
     annote, avec une cible heatmap gaussienne pour CE point ET tout autre
     point annote (meme dataset, meme frame) qui tombe dans le meme patch."""
 
-    def __init__(self, nodes_df, dataset_names, patch_shape=PATCH_SHAPE, augment=False):
+    def __init__(self, nodes_df, dataset_names, patch_shape=PATCH_SHAPE, augment=False,
+                 predict_distance=False, dist_norm_voxels=8.0):
         self.patch_shape = patch_shape
         self.augment = augment
+        # predict_distance : genere une 2e cible (champ de distance normalise
+        # aux centres les plus proches, voxels) empilee sur le heatmap
+        # gaussien -- supervision multi-tache pour dl_model.HeatmapUNet3D(
+        # predict_distance=True). dist_norm_voxels = distance (en voxels) au
+        # dela de laquelle le champ normalise atteint 0.
+        self.predict_distance = predict_distance
+        self.dist_norm_voxels = dist_norm_voxels
         self.rows = nodes_df[nodes_df.dataset.isin(dataset_names)].reset_index(drop=True)
 
         # index (dataset, t) -> liste de points, pour trouver les voisins co-visibles
@@ -213,60 +289,86 @@ class SparsePointPatchDataset(Dataset):
             patch = padded
 
         target = np.zeros(self.patch_shape, dtype=np.float32)
+        centers_mask = np.zeros(self.patch_shape, dtype=bool) if self.predict_distance else None
         for (nz, ny, nx) in self.by_frame.get((dataset_name, t), []):
             lz, ly, lx = nz - z0, ny - y0, nx - x0
             if 0 <= lz < pz and 0 <= ly < py and 0 <= lx < px:
                 target = np.maximum(target, make_gaussian_patch(self.patch_shape, (lz, ly, lx), TARGET_SIGMA))
+                if centers_mask is not None:
+                    centers_mask[lz, ly, lx] = True
+
+        dist_target = None
+        if self.predict_distance:
+            if centers_mask.any():
+                dist = distance_transform_edt(~centers_mask)
+                dist_target = np.clip(1.0 - dist / self.dist_norm_voxels, 0.0, 1.0).astype(np.float32)
+            else:
+                dist_target = np.zeros(self.patch_shape, dtype=np.float32)
 
         if self.augment:
-            patch, target = self._augment(patch, target)
+            patch, target, dist_target = self._augment(patch, target, dist_target)
+
+        if self.predict_distance:
+            target_arr = np.ascontiguousarray(np.stack([target, dist_target], axis=0))  # (2, Z, Y, X)
+        else:
+            target_arr = np.ascontiguousarray(target)[None]  # (1, Z, Y, X)
 
         # idx renvoye en plus de (patch, target) : necessaire pour le mining
         # d'exemples difficiles (train_detector.py associe une perte
         # observee a CET index precis pour ajuster sa probabilite de
         # re-tirage) -- ignore partout ailleurs (val_loader, BN update SWA).
         return torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0), \
-            torch.from_numpy(np.ascontiguousarray(target)).unsqueeze(0), \
+            torch.from_numpy(target_arr), \
             idx
 
     @staticmethod
-    def _augment(patch, target):
-        """Flips + rotation 90 (appliques identiquement au patch et a la
-        cible) + leger jitter d'intensite (patch seulement). Aucune
-        augmentation n'etait utilisee jusqu'ici -- un detecteur qui n'a vu
-        chaque cellule que sous UNE seule orientation/exposition generalise
-        moins bien, notamment sur les zones sombres ou les gradients
-        d'illumination varient d'un dataset a l'autre."""
+    def _augment(patch, target, extra=None):
+        """Flips + rotation 90 (appliques identiquement au patch, a la cible
+        et a `extra` si fourni -- la cible auxiliaire de distance-transform,
+        qui doit rester spatialement alignee) + leger jitter d'intensite
+        (patch seulement). Aucune augmentation n'etait utilisee jusqu'ici --
+        un detecteur qui n'a vu chaque cellule que sous UNE seule
+        orientation/exposition generalise moins bien, notamment sur les
+        zones sombres ou les gradients d'illumination varient d'un dataset a
+        l'autre."""
         if np.random.rand() < 0.5:
             patch, target = patch[::-1], target[::-1]
+            if extra is not None:
+                extra = extra[::-1]
         if np.random.rand() < 0.5:
             patch, target = patch[:, ::-1], target[:, ::-1]
+            if extra is not None:
+                extra = extra[:, ::-1]
         if np.random.rand() < 0.5:
             patch, target = patch[:, :, ::-1], target[:, :, ::-1]
+            if extra is not None:
+                extra = extra[:, :, ::-1]
         k = np.random.randint(4)
         if k:
             patch = np.rot90(patch, k, axes=(1, 2))
             target = np.rot90(target, k, axes=(1, 2))
+            if extra is not None:
+                extra = np.rot90(extra, k, axes=(1, 2))
 
         gamma = np.random.uniform(0.8, 1.25)
         patch = np.clip(patch, 0, 1) ** gamma
         patch = np.clip(patch + np.random.uniform(-0.05, 0.05), 0.0, 1.0)
 
         if np.random.rand() < 0.4:
-            patch, target = SparsePointPatchDataset._elastic_deform(patch, target)
+            patch, target, extra = SparsePointPatchDataset._elastic_deform(patch, target, extra)
         if np.random.rand() < 0.3:
             patch = SparsePointPatchDataset._poisson_noise(patch)
 
-        return patch, target
+        return patch, target, extra
 
     @staticmethod
-    def _elastic_deform(patch, target, alpha=6.0, sigma=4.0):
+    def _elastic_deform(patch, target, extra=None, alpha=6.0, sigma=4.0):
         """Deformation elastique : un champ de deplacement aleatoire lisse
         (bruit gaussien flou = correlation spatiale realiste) est applique
-        IDENTIQUEMENT au patch et a la cible, donc la gaussienne-cible reste
-        alignee avec la cellule deformee sans recalcul de coordonnees.
-        Particulierement utile en imagerie biologique ou les cellules se
-        deforment naturellement (contrairement a une simple rotation/flip)."""
+        IDENTIQUEMENT au patch, a la cible et a `extra` si fourni, donc tout
+        reste aligne sans recalcul de coordonnees. Particulierement utile en
+        imagerie biologique ou les cellules se deforment naturellement
+        (contrairement a une simple rotation/flip)."""
         shape = patch.shape
         # champ de deplacement brut, lisse par un flou gaussien (sigma=echelle
         # spatiale de la deformation), puis mis a l'echelle par alpha (amplitude)
@@ -282,9 +384,12 @@ class SparsePointPatchDataset(Dataset):
             np.clip(yy + dy, 0, shape[1] - 1),
             np.clip(xx + dx, 0, shape[2] - 1),
         ]
-        patch_deformed = map_coordinates(patch, coords, order=1, mode="reflect")
-        target_deformed = map_coordinates(target, coords, order=1, mode="constant", cval=0.0)
-        return patch_deformed.astype(np.float32), target_deformed.astype(np.float32)
+        patch_deformed = map_coordinates(patch, coords, order=1, mode="reflect").astype(np.float32)
+        target_deformed = map_coordinates(target, coords, order=1, mode="constant", cval=0.0).astype(np.float32)
+        extra_deformed = None
+        if extra is not None:
+            extra_deformed = map_coordinates(extra, coords, order=1, mode="constant", cval=0.0).astype(np.float32)
+        return patch_deformed, target_deformed, extra_deformed
 
     @staticmethod
     def _poisson_noise(patch, scale=60.0):
@@ -308,16 +413,63 @@ def weighted_mse_loss(pred, target, pos_weight=POS_WEIGHT, reduction="mean"):
     return se.mean()
 
 
-def compute_loss_with_aux(model, pred, target, aux_weight=0.3):
-    """Perte principale + perte auxiliaire moyenne (supervision profonde,
-    si activee) -- aide le gradient a mieux se propager dans les niveaux
-    intermediaires du decodeur, une cause frequente de plateau precoce dans
-    les reseaux encodeur-decodeur profonds."""
-    loss = weighted_mse_loss(pred, target)
+def focal_heatmap_loss(pred, target, alpha=2.0, beta=4.0, eps=1e-6, reduction="mean"):
+    """Perte focale a penalite reduite pres du pic (CornerNet/CenterNet),
+    alternative a weighted_mse_loss : le gradient est concentre sur les VRAIS
+    desaccords (pixels ou le modele se trompe vraiment) plutot que reparti
+    uniformement sur tout le voisinage pondere de chaque centre annote --
+    standard pour la regression de heatmaps de detection, cense accelerer la
+    convergence tardive (le principal symptome d'un plateau).
+
+    pos_mask = pixels au pic exact du gaussien-cible (target~1). Le seuil
+    0.99 (plutot que ==1.0 strict) tolere la legere perte de precision
+    introduite par la deformation elastique (interpolation lineaire du pic).
+    """
+    pred = pred.clamp(min=eps, max=1 - eps)
+    pos_mask = (target > 0.99).float()
+    neg_weight = torch.pow(1.0 - target, beta)
+
+    pos_loss = torch.pow(1.0 - pred, alpha) * torch.log(pred) * pos_mask
+    neg_loss = torch.pow(pred, alpha) * torch.log(1.0 - pred) * neg_weight * (1.0 - pos_mask)
+
+    spatial_dims = tuple(range(1, pos_mask.ndim))
+    n_pos = pos_mask.sum(dim=spatial_dims).clamp(min=1.0)
+    loss_per_sample = -(pos_loss + neg_loss).sum(dim=spatial_dims) / n_pos
+    if reduction == "none":
+        return loss_per_sample
+    return loss_per_sample.mean()
+
+
+def compute_loss_with_aux(model, pred, target, aux_weight=0.3, loss_fn=None, dist_weight=0.2):
+    """Perte principale (loss_fn, weighted_mse_loss par defaut) + perte
+    auxiliaire moyenne de supervision profonde (si activee) + perte de la
+    tache auxiliaire de distance-transform (si activee, toujours en MSE
+    simple -- ce n'est pas un heatmap de detection, pas de raison de
+    ponderer/focaliser). `target` peut avoir 2 canaux (heatmap + distance,
+    voir SparsePointPatchDataset(predict_distance=True)) -- seul le canal 0
+    sert de cible aux pertes heatmap/deep-supervision.
+
+    loss_fn n'affecte QUE la perte d'ENTRAINEMENT -- val_loss (suivi de
+    l'historique, early stopping, selection du meilleur checkpoint) continue
+    TOUJOURS d'utiliser weighted_mse_loss ailleurs dans run_training, pour
+    rester comparable a travers tout l'historique d'entrainement meme si le
+    choix de loss_fn change d'une run a l'autre."""
+    loss_fn = loss_fn or weighted_mse_loss
+    predict_distance = getattr(model, "predict_distance", False) and target.shape[1] > 1
+    heatmap_target = target[:, 0:1] if predict_distance else target
+
+    loss = loss_fn(pred, heatmap_target)
     aux_outputs = getattr(model, "aux_outputs", None)
     if aux_outputs:
-        aux_loss = sum(weighted_mse_loss(a, target) for a in aux_outputs) / len(aux_outputs)
+        aux_loss = sum(loss_fn(a, heatmap_target) for a in aux_outputs) / len(aux_outputs)
         loss = loss + aux_weight * aux_loss
+
+    dist_output = getattr(model, "distance_output", None)
+    if predict_distance and dist_output is not None:
+        dist_target = target[:, 1:2]
+        dist_loss = nn.functional.mse_loss(dist_output, dist_target)
+        loss = loss + dist_weight * dist_loss
+
     return loss
 
 
@@ -367,20 +519,30 @@ def _evaluate_real_score(model, model_name, val_names, device, n_datasets=2):
             (DATA_DIR / f"_tmp_{name}_submission.csv").unlink(missing_ok=True)
 
 
+_ADDITIVE_KEY_PREFIXES = ("aux_heads.", "distance_head.")
+
+
 def _load_state_dict_resumable(model, state_dict):
     """Charge un state_dict pour REPRENDRE l'entrainement, tolerant a un
     ajout purement additif d'architecture (aux_heads.* de la supervision
-    profonde, absents d'un checkpoint entraine avant son introduction) : ces
-    poids manquants restent a leur initialisation aleatoire, le reste
+    profonde, distance_head.* de la tache auxiliaire de distance-transform --
+    absents d'un checkpoint entraine avant leur introduction) : ces poids
+    manquants restent a leur initialisation aleatoire, le reste
     (encodeur/decodeur/tete principale -- l'essentiel de l'entrainement deja
     effectue) reprend normalement plutot que de tout perdre pour un
-    changement qui ne concerne qu'une sortie auxiliaire d'entrainement. Un
-    vrai changement d'architecture incompatible (ex: DETECTOR_LEVELS
+    changement qui ne concerne qu'une sortie auxiliaire d'entrainement.
+
+    ATTENTION : norm_type n'est PAS additif (BatchNorm <-> GroupNorm change
+    le TYPE de couche, pas juste des cles en plus) -- voir l'avertissement en
+    tete de dl_model.py. L'appelant doit verifier ckpt.get("norm_type") avant
+    de resumer si le norm_type courant a change.
+
+    Un vrai changement d'architecture incompatible (ex: DETECTOR_LEVELS
     modifie -> tailles de tenseurs differentes) leve quand meme une
     RuntimeError (non absorbee par strict=False), geree par l'appelant."""
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    missing = [k for k in missing if not k.startswith("aux_heads.")]
-    unexpected = [k for k in unexpected if not k.startswith("aux_heads.")]
+    missing = [k for k in missing if not k.startswith(_ADDITIVE_KEY_PREFIXES)]
+    unexpected = [k for k in unexpected if not k.startswith(_ADDITIVE_KEY_PREFIXES)]
     if missing or unexpected:
         print(f"  (reprise partielle -- cles manquantes={missing}, inattendues={unexpected})")
 
@@ -411,7 +573,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                   dropout=0.1, deep_supervision=True, aux_loss_weight=0.3,
                   lr_schedule="plateau", model_name="heatmap_unet",
                   hard_mining=True, hard_mining_start_epoch=3, hard_mining_power=1.0,
-                  real_score_every=0, real_score_datasets=2):
+                  real_score_every=0, real_score_datasets=2,
+                  loss_type="focal", predict_distance=True, dist_loss_weight=0.2,
+                  norm_type="batch", ema_decay=0.999, warmup_steps=300,
+                  use_sam=False, sam_rho=0.05):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  num_workers: {num_workers}")
 
@@ -430,8 +595,8 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         val_names = val_names[: max(1, max_datasets // 4)]
     print(f"{len(train_names)} datasets train / {len(val_names)} datasets validation")
 
-    train_ds = SparsePointPatchDataset(nodes_df, train_names, augment=True)
-    val_ds = SparsePointPatchDataset(nodes_df, val_names, augment=False)
+    train_ds = SparsePointPatchDataset(nodes_df, train_names, augment=True, predict_distance=predict_distance)
+    val_ds = SparsePointPatchDataset(nodes_df, val_names, augment=False, predict_distance=predict_distance)
 
     if val_samples and len(val_ds.rows) > val_samples:
         # sous-echantillonne la validation pour qu'elle reste rapide a chaque
@@ -472,15 +637,32 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
-    model = HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to(device)
+    # architecture partagee par TOUTES les copies du modele (model, model_cpu,
+    # swa_model, ema_model) -- doivent rester identiques pour que la copie de
+    # state_dict entre elles (sync CPU-parallele, moyennage SWA/EMA) reste valide.
+    arch_kwargs = dict(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision,
+                        predict_distance=predict_distance, norm_type=norm_type)
+
+    model = HeatmapUNet3D(**arch_kwargs).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Modele: {n_params:,} parametres (levels={DETECTOR_LEVELS}, dropout={dropout}, "
-          f"deep_supervision={deep_supervision})")
+          f"deep_supervision={deep_supervision}, predict_distance={predict_distance}, norm_type={norm_type})")
+
+    main_loss_fn = focal_heatmap_loss if loss_type == "focal" else weighted_mse_loss
+    print(f"loss_type={loss_type}" + ("  (val_loss/early-stopping restent en weighted_mse pour comparabilite)" if loss_type != "weighted_mse" else ""))
+
+    # SAM double le cout par step (2 forward/backward) et gere ses propres
+    # perturbations de poids -- combiner avec le calcul CPU-parallele
+    # (qui suppose un unique optimizer.step()) ajouterait une complexite
+    # disproportionnee pour un gain incertain, donc mutuellement exclusifs.
+    if use_sam and cpu_parallel_fraction and cpu_parallel_fraction > 0:
+        print("ATTENTION: use_sam=True desactive cpu_parallel_fraction (les deux ne sont pas combinables).")
+        cpu_parallel_fraction = 0.0
 
     # weight_decay contre le plateau (regularisation L2, decouplee -- AdamW) :
     # applique seulement aux poids des convolutions, PAS aux parametres de
-    # BatchNorm (gamma/beta) ni aux biais -- les decayer degrade generalement
-    # les performances (pratique standard).
+    # BatchNorm/GroupNorm (gamma/beta) ni aux biais -- les decayer degrade
+    # generalement les performances (pratique standard).
     decay_params, no_decay_params = [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -489,10 +671,15 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             no_decay_params.append(p)
         else:
             decay_params.append(p)
-    optimizer = torch.optim.AdamW([
+    param_groups = [
         {"params": decay_params, "weight_decay": weight_decay},
         {"params": no_decay_params, "weight_decay": 0.0},
-    ], lr=lr)
+    ]
+    if use_sam:
+        optimizer = SAM(param_groups, torch.optim.AdamW, rho=sam_rho, lr=lr)
+        print(f"SAM actif (rho={sam_rho}) -- deux forward/backward par step, cout ~x2.")
+    else:
+        optimizer = torch.optim.AdamW(param_groups, lr=lr)
     print(f"weight_decay={weight_decay} sur {len(decay_params)} tenseurs de poids "
           f"({len(no_decay_params)} tenseurs BatchNorm/biais exemptes)")
 
@@ -518,8 +705,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     swa_snapshots = deque(maxlen=swa_last_n) if swa_last_n and swa_last_n > 1 else None
 
     use_cpu_parallel = device == "cuda" and cpu_parallel_fraction and cpu_parallel_fraction > 0
-    model_cpu = (HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to("cpu")
-                 if use_cpu_parallel else None)
+    model_cpu = HeatmapUNet3D(**arch_kwargs).to("cpu") if use_cpu_parallel else None
     if use_cpu_parallel:
         print(f"CPU en parallele actif: {cpu_parallel_fraction:.0%} du batch, en meme temps que le GPU (pas en alternance)")
 
@@ -543,6 +729,11 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
 
     if resume and latest_path.exists():
         ckpt = torch.load(latest_path, map_location=device, weights_only=False)
+        ckpt_norm_type = ckpt.get("norm_type", "batch")
+        if ckpt_norm_type != norm_type:
+            print(f"  ATTENTION: ce checkpoint a ete entraine avec norm_type='{ckpt_norm_type}', different "
+                  f"du norm_type actuel ('{norm_type}') -- les statistiques de normalisation ne sont PAS "
+                  f"compatibles (voir dl_model.py). Relance avec --norm-type {ckpt_norm_type} pour une reprise propre.")
         try:
             _load_state_dict_resumable(model, ckpt["model_state"])
         except RuntimeError as exc:
@@ -560,6 +751,11 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta)
     elif resume and weights_path.exists():
         ckpt = torch.load(weights_path, map_location=device, weights_only=False)
+        ckpt_norm_type = ckpt.get("norm_type", "batch")
+        if ckpt_norm_type != norm_type:
+            print(f"  ATTENTION: ce checkpoint a ete entraine avec norm_type='{ckpt_norm_type}', different "
+                  f"du norm_type actuel ('{norm_type}') -- les statistiques de normalisation ne sont PAS "
+                  f"compatibles (voir dl_model.py). Relance avec --norm-type {ckpt_norm_type} pour une reprise propre.")
         try:
             _load_state_dict_resumable(model, ckpt["model_state"])
         except RuntimeError as exc:
@@ -572,6 +768,21 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             if log_path.exists():
                 history = json.loads(log_path.read_text())
                 epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta)
+
+    # EMA (moyenne mobile continue, voir _update_ema) : initialisee a partir
+    # de l'etat COURANT du modele (donc APRES la reprise ci-dessus, resumed
+    # ou non) -- non restauree depuis un ancien fichier _ema.pt a la reprise
+    # (se reaccumule vite depuis ce point de depart, meme simplification que
+    # best_real_score plus haut).
+    use_ema = ema_decay and ema_decay > 0
+    ema_model = None
+    best_ema_val_loss = float("inf")
+    if use_ema:
+        ema_model = HeatmapUNet3D(**arch_kwargs).to(device)
+        ema_model.load_state_dict(model.state_dict())
+        print(f"EMA active (decay={ema_decay}) -- moyenne mobile continue des poids, evaluee chaque epoque.")
+
+    global_step = 0
 
     for epoch in range(start_epoch, start_epoch + max_epochs):
         model.train()
@@ -588,71 +799,127 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             step_t0 = time.time()
             batch_n = patch.shape[0]
 
-            # calcul PARALLELE (pas en alternance) : une fraction du batch part
-            # sur un thread CPU pendant que le reste tourne sur GPU sur le
-            # thread principal, EN MEME TEMPS. Les gradients des deux portions
-            # sont ensuite fusionnes (moyenne ponderee par taille de sous-batch)
-            # avant un unique optimizer.step().
-            n_cpu = int(round(batch_n * cpu_parallel_fraction)) if use_cpu_parallel else 0
-            n_cpu = min(max(n_cpu, 0), batch_n - 1)  # au moins 1 echantillon reste sur GPU
+            # warmup lineaire du LR sur les warmup_steps premiers pas d'un
+            # entrainement FRESH (pas au resume -- start_epoch>0 -- ou ca n'a
+            # pas de sens) : stabilise le tout debut, avant que le scheduler
+            # (plateau/cosine) ne prenne le relais normalement.
+            if warmup_steps and start_epoch == 0 and global_step < warmup_steps:
+                warmup_factor = (global_step + 1) / warmup_steps
+                for g in optimizer.param_groups:
+                    g["lr"] = lr * warmup_factor
 
-            cpu_thread = None
-            cpu_result = {}
-            if n_cpu > 0:
-                patch_cpu = patch[:n_cpu].to("cpu")
-                target_cpu = target[:n_cpu].to("cpu")
-                model_cpu.load_state_dict(model.state_dict())  # sync depuis les poids GPU courants
-                cpu_thread = threading.Thread(
-                    target=_cpu_shadow_step, args=(model_cpu, patch_cpu, target_cpu, cpu_result)
-                )
-                cpu_thread.start()
+            if use_sam:
+                # SAM : deux forward/backward -- le premier localise la
+                # "pire" direction proche (first_step la applique aux poids),
+                # le second calcule le VRAI gradient a ce point perturbe puis
+                # revient au point de depart pour y appliquer le pas reel
+                # (second_step). Pas de split CPU-parallele ici (voir
+                # avertissement a la construction de l'optimiseur).
+                patch_gpu = patch.to(device, non_blocking=True)
+                target_gpu = target.to(device, non_blocking=True)
 
-            patch_gpu = patch[n_cpu:].to(device, non_blocking=True)
-            target_gpu = target[n_cpu:].to(device, non_blocking=True)
-            pred = model(patch_gpu)
-            loss = compute_loss_with_aux(model, pred, target_gpu, aux_loss_weight)
+                pred = model(patch_gpu)
+                loss = compute_loss_with_aux(model, pred, target_gpu, aux_loss_weight,
+                                              loss_fn=main_loss_fn, dist_weight=dist_loss_weight)
 
-            if train_sampler is not None:
-                # met a jour la difficulte observee (moyenne mobile) pour
-                # CHAQUE point du sous-batch GPU -- la portion CPU (si
-                # cpu_parallel_fraction>0) n'est pas trackee ici par
-                # simplicite, elle reste a poids neutre. Sans effet sur le
-                # gradient (juste de la comptabilite pour le prochain tirage).
-                with torch.no_grad():
-                    per_sample_loss = weighted_mse_loss(pred, target_gpu, reduction="none").cpu().numpy()
-                idx_gpu = idx[n_cpu:].numpy()
-                sample_loss[idx_gpu] = (
-                    HARD_MINING_MOMENTUM * sample_loss[idx_gpu] + (1 - HARD_MINING_MOMENTUM) * per_sample_loss
-                )
+                if train_sampler is not None:
+                    with torch.no_grad():
+                        heatmap_target = target_gpu[:, 0:1] if predict_distance else target_gpu
+                        per_sample_loss = main_loss_fn(pred, heatmap_target, reduction="none").cpu().numpy()
+                    idx_np = idx.numpy()
+                    sample_loss[idx_np] = (
+                        HARD_MINING_MOMENTUM * sample_loss[idx_np] + (1 - HARD_MINING_MOMENTUM) * per_sample_loss
+                    )
 
-            optimizer.zero_grad()
-            loss.backward()
-            gpu_compute_time = time.time() - step_t0  # avant jointure CPU, pour doser le sleep independamment
+                optimizer.zero_grad()
+                loss.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.first_step(zero_grad=True)
 
-            if cpu_thread is not None:
-                cpu_thread.join()
-                n_gpu = batch_n - n_cpu
-                with torch.no_grad():
-                    for p_gpu, p_cpu in zip(model.parameters(), model_cpu.parameters()):
-                        if p_cpu.grad is None:
-                            continue
-                        grad_cpu_on_gpu = p_cpu.grad.to(device)
-                        if p_gpu.grad is None:
-                            p_gpu.grad = grad_cpu_on_gpu * (n_cpu / batch_n)
-                        else:
-                            p_gpu.grad.mul_(n_gpu / batch_n).add_(grad_cpu_on_gpu, alpha=n_cpu / batch_n)
-                train_losses.append((loss.item() * n_gpu + cpu_result["loss"] * n_cpu) / batch_n)
+                pred2 = model(patch_gpu)
+                loss2 = compute_loss_with_aux(model, pred2, target_gpu, aux_loss_weight,
+                                               loss_fn=main_loss_fn, dist_weight=dist_loss_weight)
+                loss2.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                optimizer.second_step(zero_grad=True)
+
+                train_losses.append(loss.item())  # perte au point de depart, pas au point perturbe
+                gpu_compute_time = time.time() - step_t0
             else:
-                train_losses.append(loss.item())
+                # calcul PARALLELE (pas en alternance) : une fraction du batch part
+                # sur un thread CPU pendant que le reste tourne sur GPU sur le
+                # thread principal, EN MEME TEMPS. Les gradients des deux portions
+                # sont ensuite fusionnes (moyenne ponderee par taille de sous-batch)
+                # avant un unique optimizer.step().
+                n_cpu = int(round(batch_n * cpu_parallel_fraction)) if use_cpu_parallel else 0
+                n_cpu = min(max(n_cpu, 0), batch_n - 1)  # au moins 1 echantillon reste sur GPU
 
-            if grad_clip and grad_clip > 0:
-                # empeche un gradient occasionnellement enorme (patch bruite,
-                # cellule saturee) de faire un pas destabilisant -- reduit le
-                # bruit observe dans les oscillations de val_loss d'une
-                # epoque a l'autre.
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+                cpu_thread = None
+                cpu_result = {}
+                if n_cpu > 0:
+                    patch_cpu = patch[:n_cpu].to("cpu")
+                    target_cpu = target[:n_cpu].to("cpu")
+                    model_cpu.load_state_dict(model.state_dict())  # sync depuis les poids GPU courants
+                    cpu_thread = threading.Thread(
+                        target=_cpu_shadow_step,
+                        args=(model_cpu, patch_cpu, target_cpu, cpu_result, aux_loss_weight, main_loss_fn, dist_loss_weight),
+                    )
+                    cpu_thread.start()
 
-            optimizer.step()
+                patch_gpu = patch[n_cpu:].to(device, non_blocking=True)
+                target_gpu = target[n_cpu:].to(device, non_blocking=True)
+                pred = model(patch_gpu)
+                loss = compute_loss_with_aux(model, pred, target_gpu, aux_loss_weight,
+                                              loss_fn=main_loss_fn, dist_weight=dist_loss_weight)
+
+                if train_sampler is not None:
+                    # met a jour la difficulte observee (moyenne mobile) pour
+                    # CHAQUE point du sous-batch GPU -- la portion CPU (si
+                    # cpu_parallel_fraction>0) n'est pas trackee ici par
+                    # simplicite, elle reste a poids neutre. Sans effet sur le
+                    # gradient (juste de la comptabilite pour le prochain tirage).
+                    with torch.no_grad():
+                        heatmap_target = target_gpu[:, 0:1] if predict_distance else target_gpu
+                        per_sample_loss = main_loss_fn(pred, heatmap_target, reduction="none").cpu().numpy()
+                    idx_gpu = idx[n_cpu:].numpy()
+                    sample_loss[idx_gpu] = (
+                        HARD_MINING_MOMENTUM * sample_loss[idx_gpu] + (1 - HARD_MINING_MOMENTUM) * per_sample_loss
+                    )
+
+                optimizer.zero_grad()
+                loss.backward()
+                gpu_compute_time = time.time() - step_t0  # avant jointure CPU, pour doser le sleep independamment
+
+                if cpu_thread is not None:
+                    cpu_thread.join()
+                    n_gpu = batch_n - n_cpu
+                    with torch.no_grad():
+                        for p_gpu, p_cpu in zip(model.parameters(), model_cpu.parameters()):
+                            if p_cpu.grad is None:
+                                continue
+                            grad_cpu_on_gpu = p_cpu.grad.to(device)
+                            if p_gpu.grad is None:
+                                p_gpu.grad = grad_cpu_on_gpu * (n_cpu / batch_n)
+                            else:
+                                p_gpu.grad.mul_(n_gpu / batch_n).add_(grad_cpu_on_gpu, alpha=n_cpu / batch_n)
+                    train_losses.append((loss.item() * n_gpu + cpu_result["loss"] * n_cpu) / batch_n)
+                else:
+                    train_losses.append(loss.item())
+
+                if grad_clip and grad_clip > 0:
+                    # empeche un gradient occasionnellement enorme (patch bruite,
+                    # cellule saturee) de faire un pas destabilisant -- reduit le
+                    # bruit observe dans les oscillations de val_loss d'une
+                    # epoque a l'autre.
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+                optimizer.step()
+
+            if use_ema:
+                _update_ema(ema_model, model, ema_decay)
+            global_step += 1
 
             if gpu_duty_cycle and gpu_duty_cycle < 1.0 and device == "cuda":
                 # pause proportionnelle APRES la portion GPU (independante du
@@ -663,7 +930,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
 
             if save_every_steps and (step + 1) % save_every_steps == 0:
                 torch.save({"model_state": model.state_dict(), "epoch": epoch,
-                            "step_in_epoch": step + 1}, latest_path)
+                            "step_in_epoch": step + 1, "norm_type": norm_type}, latest_path)
 
             if device == "cuda" and (step + 1) % GPU_TEMP_CHECK_EVERY_STEPS == 0:
                 cooldown_if_too_hot()
@@ -674,7 +941,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             for patch, target, _idx in val_loader:
                 patch, target = patch.to(device, non_blocking=True), target.to(device, non_blocking=True)
                 pred = model(patch)
-                val_losses.append(weighted_mse_loss(pred, target).item())
+                heatmap_target = target[:, 0:1] if predict_distance else target
+                # val_loss reste TOUJOURS en weighted_mse_loss (pas main_loss_fn)
+                # -- comparable a travers tout l'historique meme si loss_type change.
+                val_losses.append(weighted_mse_loss(pred, heatmap_target).item())
 
         train_loss = float(np.mean(train_losses))
         val_loss = float(np.mean(val_losses)) if val_losses else float("nan")
@@ -689,17 +959,43 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "seconds": elapsed})
 
         # checkpoint "dernier etat" (toujours ecrase, pour reprise apres crash)
-        torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss}, latest_path)
+        torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss,
+                    "norm_type": norm_type}, latest_path)
 
         if val_loss < best_val_loss - min_delta:
             improvement_str = f"amelioration de {best_val_loss - val_loss:.5f}" if best_val_loss != float("inf") else "premier resultat"
             best_val_loss = val_loss
             epochs_without_improvement = 0
-            torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss}, weights_path)
+            torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss,
+                        "norm_type": norm_type}, weights_path)
             print(f"  -> NOUVEAU MEILLEUR ({improvement_str}), checkpoint sauvegarde: {weights_path}")
         else:
             epochs_without_improvement += 1
             print(f"  -> pas d'amelioration ({epochs_without_improvement}/{patience} avant arret automatique)")
+
+        if use_ema:
+            # EMA evaluee chaque epoque (peu couteux -- juste un passage de
+            # plus sur le petit set de validation), meilleur checkpoint EMA
+            # garde a part -- souvent legerement meilleur/plus stable que le
+            # modele "brut" une fois proche du plateau.
+            ema_model.eval()
+            ema_val_losses = []
+            with torch.no_grad():
+                for patch, target, _idx in val_loader:
+                    patch, target = patch.to(device, non_blocking=True), target.to(device, non_blocking=True)
+                    pred = ema_model(patch)
+                    heatmap_target = target[:, 0:1] if predict_distance else target
+                    ema_val_losses.append(weighted_mse_loss(pred, heatmap_target).item())
+            ema_val_loss = float(np.mean(ema_val_losses)) if ema_val_losses else float("nan")
+            history[-1]["ema_val_loss"] = ema_val_loss
+            if ema_val_loss < best_ema_val_loss:
+                best_ema_val_loss = ema_val_loss
+                ema_path = WEIGHTS_DIR / f"{model_name}_ema.pt"
+                torch.save({"model_state": ema_model.state_dict(), "epoch": epoch + 1, "val_loss": ema_val_loss,
+                            "norm_type": norm_type}, ema_path)
+                print(f"  -> EMA val_loss={ema_val_loss:.5f} : NOUVEAU MEILLEUR (EMA), sauvegarde: {ema_path}")
+            else:
+                print(f"  -> EMA val_loss={ema_val_loss:.5f}  (meilleur EMA actuel: {best_ema_val_loss:.5f})")
 
         if train_sampler is not None and (epoch + 1) >= hard_mining_start_epoch:
             # repondere le tirage pour la prochaine epoque a partir de la
@@ -729,7 +1025,8 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 if real_score > best_real_score:
                     best_real_score = real_score
                     bestreal_path = WEIGHTS_DIR / f"{model_name}_bestreal.pt"
-                    torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "real_score": real_score}, bestreal_path)
+                    torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "real_score": real_score,
+                                "norm_type": norm_type}, bestreal_path)
                     print(f"  -> vrai score = {real_score:.4f} ({time.time() - eval_t0:.1f}s) : NOUVEAU MEILLEUR "
                           f"(par score reel), sauvegarde: {bestreal_path}")
                 else:
@@ -763,26 +1060,30 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             stacked = torch.stack([sd[k].float() for sd in swa_snapshots], dim=0)
             avg_state[k] = stacked.mean(dim=0)
 
-        swa_model = HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to(device)
+        swa_model = HeatmapUNet3D(**arch_kwargs).to(device)
         swa_model.load_state_dict(avg_state)
 
         # une simple moyenne des poids rend les stats BatchNorm (running_mean/
         # running_var) incoherentes -- il faut un passage avant (sans
         # retropropagation) sur des donnees d'entrainement pour les recalculer,
-        # c'est l'etape "update_bn" standard de SWA.
-        for module in swa_model.modules():
-            if isinstance(module, nn.BatchNorm3d):
-                module.reset_running_stats()
-                module.momentum = None  # moyenne cumulative plutot qu'exponentielle
-        swa_model.train()
-        with torch.no_grad():
-            bn_update_iter = iter(train_loader)
-            for _ in range(30):
-                try:
-                    bn_patch, _, _idx = next(bn_update_iter)
-                except StopIteration:
-                    break
-                swa_model(bn_patch.to(device))
+        # c'est l'etape "update_bn" standard de SWA. Sans objet si norm_type=
+        # "groupnorm" (aucune statistique cumulee -- la boucle ne trouve alors
+        # aucun BatchNorm3d et ne fait rien).
+        has_batchnorm = any(isinstance(m, nn.BatchNorm3d) for m in swa_model.modules())
+        if has_batchnorm:
+            for module in swa_model.modules():
+                if isinstance(module, nn.BatchNorm3d):
+                    module.reset_running_stats()
+                    module.momentum = None  # moyenne cumulative plutot qu'exponentielle
+            swa_model.train()
+            with torch.no_grad():
+                bn_update_iter = iter(train_loader)
+                for _ in range(30):
+                    try:
+                        bn_patch, _, _idx = next(bn_update_iter)
+                    except StopIteration:
+                        break
+                    swa_model(bn_patch.to(device))
 
         swa_model.eval()
         swa_val_losses = []
@@ -790,11 +1091,12 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             for patch, target, _idx in val_loader:
                 patch, target = patch.to(device, non_blocking=True), target.to(device, non_blocking=True)
                 pred = swa_model(patch)
-                swa_val_losses.append(weighted_mse_loss(pred, target).item())
+                heatmap_target = target[:, 0:1] if predict_distance else target
+                swa_val_losses.append(weighted_mse_loss(pred, heatmap_target).item())
         swa_val_loss = float(np.mean(swa_val_losses)) if swa_val_losses else float("nan")
 
         swa_path = WEIGHTS_DIR / f"{model_name}_swa.pt"
-        torch.save({"model_state": swa_model.state_dict(), "val_loss": swa_val_loss}, swa_path)
+        torch.save({"model_state": swa_model.state_dict(), "val_loss": swa_val_loss, "norm_type": norm_type}, swa_path)
         verdict = "MEILLEUR que le modele classique" if swa_val_loss < best_val_loss else "pas meilleur, garde a titre de reference"
         print(f"SWA val_loss={swa_val_loss:.5f}  (meilleur classique={best_val_loss:.5f}) -> {verdict}")
         print(f"Sauvegarde: {swa_path}")
@@ -873,6 +1175,34 @@ if __name__ == "__main__":
     parser.add_argument("--real-score-datasets", type=int, default=2,
                          help="nombre de datasets de validation utilises pour l'evaluation periodique "
                               "du vrai score (plus = plus fiable mais plus lent)")
+    parser.add_argument("--loss-type", choices=["weighted_mse", "focal"], default="focal",
+                         help="'weighted_mse' = MSE ponderee classique (comportement d'origine), "
+                              "'focal' (defaut) = perte focale type CenterNet, concentre le gradient sur "
+                              "les vrais desaccords. N'affecte QUE la perte d'entrainement -- val_loss "
+                              "reste toujours en weighted_mse pour rester comparable a l'historique.")
+    parser.add_argument("--no-predict-distance", action="store_false", dest="predict_distance",
+                         help="desactive la tache auxiliaire de distance-transform (active par defaut)")
+    parser.add_argument("--dist-loss-weight", type=float, default=0.2,
+                         help="poids de la perte de distance-transform dans la perte totale")
+    parser.add_argument("--norm-type", choices=["batch", "groupnorm"], default="batch",
+                         help="'batch' (defaut, compatibilite totale avec les checkpoints existants) ou "
+                              "'groupnorm' (independant de la taille de batch, potentiellement plus stable "
+                              "avec de petits sous-batchs -- CHANGE le type de couche partout dans le "
+                              "reseau, voir avertissement dans dl_model.py, pas un simple ajout)")
+    parser.add_argument("--ema-decay", type=float, default=0.999,
+                         help="moyenne mobile exponentielle CONTINUE des poids (mise a jour a chaque step, "
+                              "contrairement a SWA qui n'agit qu'en fin d'entrainement), meilleur checkpoint "
+                              "garde a part (weights/<nom>_ema.pt). 0 pour desactiver.")
+    parser.add_argument("--warmup-steps", type=int, default=300,
+                         help="montee lineaire du lr sur les N premiers pas d'un entrainement FRESH (pas "
+                              "au resume) avant que le scheduler ne prenne le relais. 0 pour desactiver.")
+    parser.add_argument("--use-sam", action="store_true",
+                         help="active l'optimiseur SAM (Sharpness-Aware Minimization) -- cherche des minima "
+                              "plats, generalise souvent mieux, mais DOUBLE le cout par step (deux "
+                              "forward/backward). Incompatible avec --cpu-parallel-fraction (desactive "
+                              "automatiquement). Off par defaut vu le cout.")
+    parser.add_argument("--sam-rho", type=float, default=0.05,
+                         help="rayon du voisinage explore par SAM (n'a d'effet que si --use-sam)")
     args = parser.parse_args()
 
     run_training(
@@ -889,4 +1219,8 @@ if __name__ == "__main__":
         hard_mining=args.hard_mining, hard_mining_start_epoch=args.hard_mining_start_epoch,
         hard_mining_power=args.hard_mining_power,
         real_score_every=args.real_score_every, real_score_datasets=args.real_score_datasets,
+        loss_type=args.loss_type, predict_distance=args.predict_distance,
+        dist_loss_weight=args.dist_loss_weight, norm_type=args.norm_type,
+        ema_decay=args.ema_decay, warmup_steps=args.warmup_steps,
+        use_sam=args.use_sam, sam_rho=args.sam_rho,
     )
