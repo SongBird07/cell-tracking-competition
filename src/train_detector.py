@@ -226,7 +226,8 @@ class SparsePointPatchDataset(Dataset):
     point annote (meme dataset, meme frame) qui tombe dans le meme patch."""
 
     def __init__(self, nodes_df, dataset_names, patch_shape=PATCH_SHAPE, augment=False,
-                 predict_distance=False, dist_norm_voxels=8.0):
+                 predict_distance=False, dist_norm_voxels=8.0,
+                 curriculum=False, curriculum_radius=20.0):
         self.patch_shape = patch_shape
         self.augment = augment
         # predict_distance : genere une 2e cible (champ de distance normalise
@@ -247,8 +248,34 @@ class SparsePointPatchDataset(Dataset):
         self._zarr_cache = {}
         self._quantile_cache = {}
 
+        # curriculum learning : poids A PRIORI (pas bases sur une perte
+        # observee, contrairement au mining d'exemples difficiles) qui
+        # favorisent les points ISOLES (cellules bien separees) en tout
+        # debut d'entrainement -- voir _compute_curriculum_weights.
+        self.curriculum_weights = self._compute_curriculum_weights(curriculum_radius) if curriculum else None
+
     def __len__(self):
         return len(self.rows)
+
+    def _compute_curriculum_weights(self, radius):
+        """Densite locale par frame (nombre de voisins annotes dans un rayon
+        de `radius` voxels, memorisee une fois par frame et reutilisee pour
+        tous ses points) -- proxy geometrique de difficulte disponible AVANT
+        tout entrainement (contrairement au mining d'exemples difficiles, qui
+        a besoin d'une perte observee). Poids inversement proportionnel a
+        cette densite (isole = facile = poids eleve), melange 50/50 avec un
+        poids uniforme -- meme logique de stabilite que le mining d'exemples
+        difficiles, pour ne pas ignorer totalement les cas denses des le
+        debut."""
+        frame_positions = {key: np.array(pts, dtype=np.float32) for key, pts in self.by_frame.items()}
+        crowding = np.zeros(len(self.rows), dtype=np.float32)
+        for i, row in enumerate(self.rows.itertuples()):
+            pts = frame_positions[(row.dataset, row.t)]
+            center = np.array([row.z, row.y, row.x], dtype=np.float32)
+            dists = np.linalg.norm(pts - center, axis=1)
+            crowding[i] = np.sum((dists > 0) & (dists < radius))
+        inv = 1.0 / (1.0 + crowding)
+        return 0.5 * (inv / inv.mean()) + 0.5
 
     def _get_volume(self, dataset_name):
         if dataset_name not in self._zarr_cache:
@@ -473,6 +500,65 @@ def compute_loss_with_aux(model, pred, target, aux_weight=0.3, loss_fn=None, dis
     return loss
 
 
+def _pseudo_label_pass(model, train_ds, dataset_names, device, threshold=0.9, min_distance=6, max_frames=5, seed=0):
+    """Pseudo-labellisation : ajoute au pool d'annotations d'ENTRAINEMENT des
+    points a HAUTE confiance detectes par le modele ACTUEL mais absents des
+    annotations sparses d'origine. Utile car les annotations de ce jeu de
+    donnees sont clairsemees -- une vraie cellule visible mais non-annotee
+    est actuellement punie a tort comme du "fond" dans la cible heatmap.
+
+    RISQUE INHERENT : si le modele est deja confiant a tort (faux positif
+    confiant), cette passe RENFORCE l'erreur au lieu de la corriger --
+    d'ou un seuil de confiance eleve par defaut (0.9) et un nombre de
+    frames limite par appel (max_frames), a n'activer qu'avec prudence
+    (pseudo_label_every dans run_training, off par defaut).
+
+    Modifie train_ds.by_frame IN-PLACE (jamais val_ds -- val_loss doit
+    rester une mesure honnete, non influencee par les propres predictions du
+    modele). Les patchs deja construits ne sont pas affectes retroactivement,
+    seules les epoques SUIVANTES en beneficient (nouvelle cible heatmap au
+    prochain __getitem__ de ce (dataset, frame))."""
+    from skimage.feature import peak_local_max
+
+    was_training = model.training
+    model.eval()
+    rng = random.Random(seed)
+    keys = [k for k in train_ds.by_frame.keys() if k[0] in dataset_names]
+    rng.shuffle(keys)
+
+    n_added, frames_checked = 0, 0
+    with torch.no_grad():
+        for (dataset_name, t) in keys:
+            if frames_checked >= max_frames:
+                break
+            arr, quantiles = train_ds._get_volume(dataset_name)
+            frame = arr[t][:].astype(np.float32)
+            q_lo = quantiles.get("0.1", 0.0)
+            q_hi = quantiles.get("0.999", frame.max() + 1e-6)
+            norm = np.clip((frame - q_lo) / max(q_hi - q_lo, 1e-6), 0.0, 1.0)
+
+            pads = [(0, (-d) % 8) for d in norm.shape]  # 3 niveaux de pooling -> divisible par 8
+            padded = np.pad(norm, pads, mode="constant") if any(p != (0, 0) for p in pads) else norm
+            x = torch.from_numpy(padded).unsqueeze(0).unsqueeze(0).to(device)
+            heatmap = model(x)[0, 0].cpu().numpy()
+            heatmap = heatmap[tuple(slice(0, d) for d in norm.shape)]
+
+            coords = peak_local_max(heatmap, min_distance=min_distance, threshold_abs=threshold)
+            key = (dataset_name, t)
+            existing = np.array(train_ds.by_frame[key], dtype=np.float32) if train_ds.by_frame[key] else np.empty((0, 3))
+            for (z, y, x_) in coords:
+                if existing.size:
+                    if np.linalg.norm(existing - np.array([z, y, x_]), axis=1).min() < min_distance:
+                        continue
+                train_ds.by_frame[key].append((int(z), int(y), int(x_)))
+                n_added += 1
+            frames_checked += 1
+
+    if was_training:
+        model.train()
+    return n_added, frames_checked
+
+
 def _evaluate_real_score(model, model_name, val_names, device, n_datasets=2):
     """Evalue la vraie metrique de competition (edge Jaccard + 0.1*division
     Jaccard, voir multi_sample_evaluate.py) sur quelques datasets de
@@ -576,7 +662,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                   real_score_every=0, real_score_datasets=2,
                   loss_type="focal", predict_distance=True, dist_loss_weight=0.2,
                   norm_type="batch", ema_decay=0.999, warmup_steps=300,
-                  use_sam=False, sam_rho=0.05):
+                  use_sam=False, sam_rho=0.05,
+                  curriculum=True, curriculum_radius=20.0,
+                  pseudo_label_every=0, pseudo_label_threshold=0.9,
+                  pseudo_label_min_distance=6, pseudo_label_max_frames=5):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  num_workers: {num_workers}")
 
@@ -595,7 +684,8 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         val_names = val_names[: max(1, max_datasets // 4)]
     print(f"{len(train_names)} datasets train / {len(val_names)} datasets validation")
 
-    train_ds = SparsePointPatchDataset(nodes_df, train_names, augment=True, predict_distance=predict_distance)
+    train_ds = SparsePointPatchDataset(nodes_df, train_names, augment=True, predict_distance=predict_distance,
+                                        curriculum=curriculum, curriculum_radius=curriculum_radius)
     val_ds = SparsePointPatchDataset(nodes_df, val_names, augment=False, predict_distance=predict_distance)
 
     if val_samples and len(val_ds.rows) > val_samples:
@@ -625,13 +715,25 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     # ecarts de difficulte n'emergent qu'apres quelques epoques
     # (hard_mining_start_epoch retarde l'activation, le signal initial est
     # trop bruite pour etre utile).
+    # curriculum learning : au tout debut (avant que hard_mining_start_epoch
+    # ne soit atteint), le MEME sampler part des poids de curriculum
+    # (statiques, favorisent les points isoles -- voir
+    # SparsePointPatchDataset._compute_curriculum_weights) plutot que d'un
+    # tirage uniforme. Des que le mining d'exemples difficiles s'active, ses
+    # poids (bases sur la perte REELLEMENT observee) ecrasent naturellement
+    # ceux du curriculum -- transition sans code special.
     sample_loss = np.ones(len(train_ds), dtype=np.float64)
-    if hard_mining:
+    need_sampler = hard_mining or curriculum
+    if need_sampler:
+        initial_weights = (torch.as_tensor(train_ds.curriculum_weights, dtype=torch.double)
+                            if curriculum and train_ds.curriculum_weights is not None
+                            else torch.ones(len(train_ds), dtype=torch.double))
         train_sampler = torch.utils.data.WeightedRandomSampler(
-            weights=torch.ones(len(train_ds), dtype=torch.double),
-            num_samples=len(train_ds), replacement=True,
+            weights=initial_weights, num_samples=len(train_ds), replacement=True,
         )
         train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, **loader_kwargs)
+        if curriculum:
+            print("Curriculum actif : privilegie les points isoles (cellules bien separees) au debut de l'entrainement.")
     else:
         train_sampler = None
         train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
@@ -997,10 +1099,13 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             else:
                 print(f"  -> EMA val_loss={ema_val_loss:.5f}  (meilleur EMA actuel: {best_ema_val_loss:.5f})")
 
-        if train_sampler is not None and (epoch + 1) >= hard_mining_start_epoch:
+        if hard_mining and train_sampler is not None and (epoch + 1) >= hard_mining_start_epoch:
             # repondere le tirage pour la prochaine epoque a partir de la
-            # difficulte observee (voir creation du sampler plus haut pour
-            # le detail du melange 50/50 avec un poids uniforme).
+            # difficulte REELLEMENT observee -- ecrase naturellement les
+            # poids de curriculum (statiques, a priori) une fois ce point
+            # atteint. Si hard_mining=False (curriculum seul), ce bloc ne
+            # s'execute jamais : les poids de curriculum restent actifs pour
+            # toute la duree de l'entrainement.
             w = np.clip(sample_loss, 1e-6, None) ** hard_mining_power
             w = 0.5 * (w / w.mean()) + 0.5
             train_sampler.weights = torch.as_tensor(w, dtype=torch.double)
@@ -1032,6 +1137,19 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 else:
                     print(f"  -> vrai score = {real_score:.4f} ({time.time() - eval_t0:.1f}s)  "
                           f"(meilleur reel actuel: {best_real_score:.4f})")
+
+        if pseudo_label_every and (epoch + 1) % pseudo_label_every == 0:
+            # densifie le signal sparse en ajoutant les detections a HAUTE
+            # confiance non-annotees -- voir avertissement de risque dans
+            # _pseudo_label_pass. Uniquement train_ds (jamais val_ds).
+            pl_t0 = time.time()
+            n_added, n_frames = _pseudo_label_pass(
+                model, train_ds, train_names, device,
+                threshold=pseudo_label_threshold, min_distance=pseudo_label_min_distance,
+                max_frames=pseudo_label_max_frames, seed=seed + epoch,
+            )
+            print(f"  -> pseudo-labellisation: {n_added} nouveaux points ajoutes sur "
+                  f"{n_frames} frames examinees ({time.time() - pl_t0:.1f}s)")
 
         log_path.write_text(json.dumps(history, indent=2))
 
@@ -1203,6 +1321,23 @@ if __name__ == "__main__":
                               "automatiquement). Off par defaut vu le cout.")
     parser.add_argument("--sam-rho", type=float, default=0.05,
                          help="rayon du voisinage explore par SAM (n'a d'effet que si --use-sam)")
+    parser.add_argument("--no-curriculum", action="store_false", dest="curriculum",
+                         help="desactive le curriculum learning (actif par defaut) -- sans lui, le tirage "
+                              "est uniforme jusqu'a ce que le mining d'exemples difficiles s'active")
+    parser.add_argument("--curriculum-radius", type=float, default=20.0,
+                         help="rayon (voxels) utilise pour estimer la densite locale de points annotes "
+                              "(proxy de difficulte a priori pour le curriculum)")
+    parser.add_argument("--pseudo-label-every", type=int, default=0,
+                         help="toutes les N epoques, ajoute au pool d'annotations d'entrainement les "
+                              "detections a HAUTE confiance non-annotees (densifie le signal sparse). "
+                              "RISQUE: peut renforcer les erreurs du modele si mal calibre -- 0 pour "
+                              "desactiver (defaut, prudence recommandee).")
+    parser.add_argument("--pseudo-label-threshold", type=float, default=0.9,
+                         help="confiance minimale (heatmap) pour qu'une detection devienne un pseudo-label")
+    parser.add_argument("--pseudo-label-min-distance", type=int, default=6,
+                         help="distance minimale (voxels) a un point deja annote pour compter comme nouveau")
+    parser.add_argument("--pseudo-label-max-frames", type=int, default=5,
+                         help="nombre de frames examinees a chaque passe de pseudo-labellisation")
     args = parser.parse_args()
 
     run_training(
@@ -1223,4 +1358,8 @@ if __name__ == "__main__":
         dist_loss_weight=args.dist_loss_weight, norm_type=args.norm_type,
         ema_decay=args.ema_decay, warmup_steps=args.warmup_steps,
         use_sam=args.use_sam, sam_rho=args.sam_rho,
+        curriculum=args.curriculum, curriculum_radius=args.curriculum_radius,
+        pseudo_label_every=args.pseudo_label_every, pseudo_label_threshold=args.pseudo_label_threshold,
+        pseudo_label_min_distance=args.pseudo_label_min_distance,
+        pseudo_label_max_frames=args.pseudo_label_max_frames,
     )
