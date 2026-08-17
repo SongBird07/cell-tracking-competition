@@ -367,6 +367,24 @@ def _evaluate_real_score(model, model_name, val_names, device, n_datasets=2):
             (DATA_DIR / f"_tmp_{name}_submission.csv").unlink(missing_ok=True)
 
 
+def _load_state_dict_resumable(model, state_dict):
+    """Charge un state_dict pour REPRENDRE l'entrainement, tolerant a un
+    ajout purement additif d'architecture (aux_heads.* de la supervision
+    profonde, absents d'un checkpoint entraine avant son introduction) : ces
+    poids manquants restent a leur initialisation aleatoire, le reste
+    (encodeur/decodeur/tete principale -- l'essentiel de l'entrainement deja
+    effectue) reprend normalement plutot que de tout perdre pour un
+    changement qui ne concerne qu'une sortie auxiliaire d'entrainement. Un
+    vrai changement d'architecture incompatible (ex: DETECTOR_LEVELS
+    modifie -> tailles de tenseurs differentes) leve quand meme une
+    RuntimeError (non absorbee par strict=False), geree par l'appelant."""
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    missing = [k for k in missing if not k.startswith("aux_heads.")]
+    unexpected = [k for k in unexpected if not k.startswith("aux_heads.")]
+    if missing or unexpected:
+        print(f"  (reprise partielle -- cles manquantes={missing}, inattendues={unexpected})")
+
+
 def _count_epochs_since_best(history, best_val_loss, min_delta):
     """Reconstruit le compteur 'epoques sans amelioration' a partir du log,
     pour que l'early stopping reste coherent apres une reprise (resume)."""
@@ -526,7 +544,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     if resume and latest_path.exists():
         ckpt = torch.load(latest_path, map_location=device, weights_only=False)
         try:
-            model.load_state_dict(ckpt["model_state"])
+            _load_state_dict_resumable(model, ckpt["model_state"])
         except RuntimeError as exc:
             # l'architecture du checkpoint ne correspond plus a DETECTOR_LEVELS
             # (ex: capacite du modele changee) -- on ne peut pas reprendre,
@@ -543,7 +561,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     elif resume and weights_path.exists():
         ckpt = torch.load(weights_path, map_location=device, weights_only=False)
         try:
-            model.load_state_dict(ckpt["model_state"])
+            _load_state_dict_resumable(model, ckpt["model_state"])
         except RuntimeError as exc:
             print(f"Checkpoint incompatible avec l'architecture actuelle ({exc}); reprise ignoree, entrainement a partir de zero.")
             ckpt = None
