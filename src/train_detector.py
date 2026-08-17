@@ -633,12 +633,19 @@ def _load_state_dict_resumable(model, state_dict):
         print(f"  (reprise partielle -- cles manquantes={missing}, inattendues={unexpected})")
 
 
-def _count_epochs_since_best(history, best_val_loss, min_delta):
+def _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss=None):
     """Reconstruit le compteur 'epoques sans amelioration' a partir du log,
-    pour que l'early stopping reste coherent apres une reprise (resume)."""
+    pour que l'early stopping reste coherent apres une reprise (resume).
+    S'arrete a la derniere epoque ou soit val_loss, soit ema_val_loss (si
+    fourni) etait a son meilleur -- coherent avec le reset combine du
+    compteur pendant l'entrainement (voir run_training)."""
     count = 0
     for h in reversed(history):
-        if h["val_loss"] == h["val_loss"] and h["val_loss"] <= best_val_loss + min_delta:
+        val_ok = h["val_loss"] == h["val_loss"] and h["val_loss"] <= best_val_loss + min_delta
+        ema_val = h.get("ema_val_loss")
+        ema_ok = (best_ema_val_loss is not None and ema_val is not None
+                  and ema_val == ema_val and ema_val <= best_ema_val_loss + min_delta)
+        if val_ok or ema_ok:
             break
         count += 1
     return count
@@ -823,6 +830,12 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     history = []
     start_epoch = 0
     best_val_loss = float("inf")
+    # reconstruit depuis le log a la reprise (comme best_val_loss) -- sert a
+    # calculer correctement epochs_without_improvement (voir plus bas, le
+    # compteur de patience reset desormais sur une amelioration de val_loss
+    # OU d'EMA). Le MODELE ema_model, lui, n'est pas restaure depuis
+    # l'ancien fichier _ema.pt (voir plus bas) -- seule cette valeur l'est.
+    best_ema_val_loss = float("inf")
     epochs_without_improvement = 0
     # non restaure a la reprise (recalcule vite: quelques evaluations reelles
     # suffisent a retrouver un ordre de grandeur correct) -- weights/<nom>_bestreal.pt
@@ -850,7 +863,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             if log_path.exists():
                 history = json.loads(log_path.read_text())
                 best_val_loss = min((h["val_loss"] for h in history if h["val_loss"] == h["val_loss"]), default=float("inf"))
-                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta)
+                best_ema_val_loss = min((h["ema_val_loss"] for h in history
+                                          if h.get("ema_val_loss") is not None and h["ema_val_loss"] == h["ema_val_loss"]),
+                                         default=float("inf"))
+                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss)
     elif resume and weights_path.exists():
         ckpt = torch.load(weights_path, map_location=device, weights_only=False)
         ckpt_norm_type = ckpt.get("norm_type", "batch")
@@ -869,13 +885,18 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             print(f"Reprise depuis {weights_path} (epoque {start_epoch} deja effectuee, meilleur val_loss={best_val_loss:.5f})")
             if log_path.exists():
                 history = json.loads(log_path.read_text())
-                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta)
+                best_ema_val_loss = min((h["ema_val_loss"] for h in history
+                                          if h.get("ema_val_loss") is not None and h["ema_val_loss"] == h["ema_val_loss"]),
+                                         default=float("inf"))
+                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss)
 
-    # EMA (moyenne mobile continue, voir _update_ema) : initialisee a partir
-    # de l'etat COURANT du modele (donc APRES la reprise ci-dessus, resumed
-    # ou non) -- non restauree depuis un ancien fichier _ema.pt a la reprise
-    # (se reaccumule vite depuis ce point de depart, meme simplification que
-    # best_real_score plus haut).
+    # EMA (moyenne mobile continue, voir _update_ema) : le MODELE est
+    # initialise a partir de l'etat COURANT du modele (donc APRES la reprise
+    # ci-dessus, resumed ou non) -- non restaure depuis un ancien fichier
+    # _ema.pt (se reaccumule vite depuis ce point de depart, meme
+    # simplification que best_real_score plus haut). best_ema_val_loss (la
+    # VALEUR, pour les comparaisons "meilleur jusqu'ici"), en revanche, EST
+    # reconstruite depuis le log ci-dessus.
     use_ema = ema_decay and ema_decay > 0
     ema_model = None
     best_ema_val_loss = float("inf")
@@ -1064,17 +1085,22 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss,
                     "norm_type": norm_type}, latest_path)
 
-        if val_loss < best_val_loss - min_delta:
+        # val_improved/ema_improved decident ENSEMBLE du reset du compteur de
+        # patience (voir plus bas) -- avant, seule une amelioration de
+        # val_loss le resetait, ce qui pouvait arreter l'entrainement trop
+        # tot si le modele "brut" plafonne pendant que l'EMA continue de
+        # progresser discretement (frequent une fois proche de la convergence).
+        val_improved = val_loss < best_val_loss - min_delta
+        if val_improved:
             improvement_str = f"amelioration de {best_val_loss - val_loss:.5f}" if best_val_loss != float("inf") else "premier resultat"
             best_val_loss = val_loss
-            epochs_without_improvement = 0
             torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss,
                         "norm_type": norm_type}, weights_path)
             print(f"  -> NOUVEAU MEILLEUR ({improvement_str}), checkpoint sauvegarde: {weights_path}")
         else:
-            epochs_without_improvement += 1
-            print(f"  -> pas d'amelioration ({epochs_without_improvement}/{patience} avant arret automatique)")
+            print(f"  -> pas d'amelioration (val_loss)")
 
+        ema_improved = False
         if use_ema:
             # EMA evaluee chaque epoque (peu couteux -- juste un passage de
             # plus sur le petit set de validation), meilleur checkpoint EMA
@@ -1090,7 +1116,8 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                     ema_val_losses.append(weighted_mse_loss(pred, heatmap_target).item())
             ema_val_loss = float(np.mean(ema_val_losses)) if ema_val_losses else float("nan")
             history[-1]["ema_val_loss"] = ema_val_loss
-            if ema_val_loss < best_ema_val_loss:
+            ema_improved = ema_val_loss < best_ema_val_loss - min_delta
+            if ema_improved:
                 best_ema_val_loss = ema_val_loss
                 ema_path = WEIGHTS_DIR / f"{model_name}_ema.pt"
                 torch.save({"model_state": ema_model.state_dict(), "epoch": epoch + 1, "val_loss": ema_val_loss,
@@ -1098,6 +1125,15 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 print(f"  -> EMA val_loss={ema_val_loss:.5f} : NOUVEAU MEILLEUR (EMA), sauvegarde: {ema_path}")
             else:
                 print(f"  -> EMA val_loss={ema_val_loss:.5f}  (meilleur EMA actuel: {best_ema_val_loss:.5f})")
+
+        # arret automatique base sur les DEUX signaux : soit le modele
+        # "brut" soit l'EMA suffit a montrer que l'entrainement progresse
+        # encore -- reset le compteur si l'un ou l'autre s'ameliore.
+        if val_improved or ema_improved:
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+        print(f"  -> {epochs_without_improvement}/{patience} epoques sans amelioration (val_loss ou EMA) avant arret automatique")
 
         if hard_mining and train_sampler is not None and (epoch + 1) >= hard_mining_start_epoch:
             # repondere le tirage pour la prochaine epoque a partir de la
