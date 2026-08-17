@@ -98,7 +98,7 @@ def _cpu_shadow_step(model_cpu, patch_cpu, target_cpu, result_holder):
     progressent reellement en parallele."""
     model_cpu.zero_grad()
     pred = model_cpu(patch_cpu)
-    loss = weighted_mse_loss(pred, target_cpu)
+    loss = compute_loss_with_aux(model_cpu, pred, target_cpu)
     loss.backward()
     result_holder["loss"] = loss.item()
 
@@ -280,6 +280,19 @@ def weighted_mse_loss(pred, target, pos_weight=POS_WEIGHT):
     return (weight * (pred - target) ** 2).mean()
 
 
+def compute_loss_with_aux(model, pred, target, aux_weight=0.3):
+    """Perte principale + perte auxiliaire moyenne (supervision profonde,
+    si activee) -- aide le gradient a mieux se propager dans les niveaux
+    intermediaires du decodeur, une cause frequente de plateau precoce dans
+    les reseaux encodeur-decodeur profonds."""
+    loss = weighted_mse_loss(pred, target)
+    aux_outputs = getattr(model, "aux_outputs", None)
+    if aux_outputs:
+        aux_loss = sum(weighted_mse_loss(a, target) for a in aux_outputs) / len(aux_outputs)
+        loss = loss + aux_weight * aux_loss
+    return loss
+
+
 def _count_epochs_since_best(history, best_val_loss, min_delta):
     """Reconstruit le compteur 'epoques sans amelioration' a partir du log,
     pour que l'early stopping reste coherent apres une reprise (resume)."""
@@ -302,9 +315,19 @@ def split_datasets(nodes_df, val_fraction=0.2, seed=0):
 def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None, val_samples=1000,
                   device=None, seed=0, num_workers=6, resume=True, save_every_steps=100,
                   patience=6, min_delta=1e-5, gpu_duty_cycle=1.0, cpu_parallel_fraction=0.0,
-                  weight_decay=1e-4, lr_patience=3, lr_factor=0.5, grad_clip=1.0, swa_last_n=5):
+                  weight_decay=1e-4, lr_patience=3, lr_factor=0.5, grad_clip=1.0, swa_last_n=5,
+                  dropout=0.1, deep_supervision=True, aux_loss_weight=0.3,
+                  lr_schedule="plateau", model_name="heatmap_unet"):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  num_workers: {num_workers}")
+
+    # seed distincte par modele -> initialisation des poids ET ordre de
+    # tirage des donnees differents, condition necessaire pour qu'un
+    # ensemble de plusieurs modeles apporte reellement de la diversite
+    # (sinon plusieurs runs convergeraient vers un modele quasi-identique)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 
     nodes_df = ensure_gt_index()
     train_names, val_names = split_datasets(nodes_df)
@@ -334,9 +357,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
-    model = HeatmapUNet3D(levels=DETECTOR_LEVELS).to(device)
+    model = HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"Modele: {n_params:,} parametres (levels={DETECTOR_LEVELS})")
+    print(f"Modele: {n_params:,} parametres (levels={DETECTOR_LEVELS}, dropout={dropout}, "
+          f"deep_supervision={deep_supervision})")
 
     # weight_decay contre le plateau (regularisation L2, decouplee -- AdamW) :
     # applique seulement aux poids des convolutions, PAS aux parametres de
@@ -360,9 +384,17 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     # reduit lr automatiquement quand val_loss stagne -- complement du
     # weight_decay : celui-ci regularise, le scheduler affine la convergence
     # une fois que les pas actuels sont trop grands pour progresser encore.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=lr_factor, patience=lr_patience
-    )
+    # "cosine" est une alternative qui remonte lr periodiquement (warm
+    # restarts) au lieu de seulement le reduire -- peut aider a s'echapper
+    # d'un minimum local pointu plutot que de s'y installer.
+    if lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+        scheduler_needs_val_loss = False
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=lr_factor, patience=lr_patience
+        )
+        scheduler_needs_val_loss = True
 
     # SWA (Stochastic Weight Averaging) : conserve les N derniers etats du
     # modele (copies CPU, ~22 Mo chacune) pour les moyenner en fin
@@ -371,13 +403,19 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     swa_snapshots = deque(maxlen=swa_last_n) if swa_last_n and swa_last_n > 1 else None
 
     use_cpu_parallel = device == "cuda" and cpu_parallel_fraction and cpu_parallel_fraction > 0
-    model_cpu = HeatmapUNet3D(levels=DETECTOR_LEVELS).to("cpu") if use_cpu_parallel else None
+    model_cpu = (HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to("cpu")
+                 if use_cpu_parallel else None)
     if use_cpu_parallel:
         print(f"CPU en parallele actif: {cpu_parallel_fraction:.0%} du batch, en meme temps que le GPU (pas en alternance)")
 
-    weights_path = WEIGHTS_DIR / "heatmap_unet.pt"
-    latest_path = WEIGHTS_DIR / "heatmap_unet_latest.pt"
-    log_path = WEIGHTS_DIR / "train_log.json"
+    # model_name permet d'entrainer plusieurs modeles independants (seeds
+    # differentes) sans qu'ils s'ecrasent -- utile pour constituer un
+    # ensemble a l'inference (moyenne des predictions de plusieurs modeles).
+    # Avec le nom par defaut, les chemins sont IDENTIQUES a avant (compatible
+    # avec les checkpoints/logs deja existants).
+    weights_path = WEIGHTS_DIR / f"{model_name}.pt"
+    latest_path = WEIGHTS_DIR / f"{model_name}_latest.pt"
+    log_path = WEIGHTS_DIR / ("train_log.json" if model_name == "heatmap_unet" else f"train_log_{model_name}.json")
 
     history = []
     start_epoch = 0
@@ -453,7 +491,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             patch_gpu = patch[n_cpu:].to(device, non_blocking=True)
             target_gpu = target[n_cpu:].to(device, non_blocking=True)
             pred = model(patch_gpu)
-            loss = weighted_mse_loss(pred, target_gpu)
+            loss = compute_loss_with_aux(model, pred, target_gpu, aux_loss_weight)
 
             optimizer.zero_grad()
             loss.backward()
@@ -537,10 +575,13 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             swa_snapshots.append(copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()}))
 
         lr_before = optimizer.param_groups[0]["lr"]
-        scheduler.step(val_loss)
+        scheduler.step(val_loss) if scheduler_needs_val_loss else scheduler.step()
         lr_after = optimizer.param_groups[0]["lr"]
         if lr_after < lr_before:
-            print(f"  -> lr reduit: {lr_before:.2e} -> {lr_after:.2e} (val_loss stagne)")
+            reason = "descente cosine" if lr_schedule == "cosine" else "val_loss stagne"
+            print(f"  -> lr reduit: {lr_before:.2e} -> {lr_after:.2e} ({reason})")
+        elif lr_after > lr_before:
+            print(f"  -> lr remonte: {lr_before:.2e} -> {lr_after:.2e} (redemarrage cosine)")
 
         if epochs_without_improvement >= patience:
             print(f"\nArret automatique (early stopping) : pas d'amelioration depuis {patience} epoques.")
@@ -555,7 +596,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             stacked = torch.stack([sd[k].float() for sd in swa_snapshots], dim=0)
             avg_state[k] = stacked.mean(dim=0)
 
-        swa_model = HeatmapUNet3D(levels=DETECTOR_LEVELS).to(device)
+        swa_model = HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to(device)
         swa_model.load_state_dict(avg_state)
 
         # une simple moyenne des poids rend les stats BatchNorm (running_mean/
@@ -585,7 +626,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 swa_val_losses.append(weighted_mse_loss(pred, target).item())
         swa_val_loss = float(np.mean(swa_val_losses)) if swa_val_losses else float("nan")
 
-        swa_path = WEIGHTS_DIR / "heatmap_unet_swa.pt"
+        swa_path = WEIGHTS_DIR / f"{model_name}_swa.pt"
         torch.save({"model_state": swa_model.state_dict(), "val_loss": swa_val_loss}, swa_path)
         verdict = "MEILLEUR que le modele classique" if swa_val_loss < best_val_loss else "pas meilleur, garde a titre de reference"
         print(f"SWA val_loss={swa_val_loss:.5f}  (meilleur classique={best_val_loss:.5f}) -> {verdict}")
@@ -629,6 +670,25 @@ if __name__ == "__main__":
                          help="fraction du batch traitee sur CPU EN PARALLELE du GPU (pas en alternance) a "
                               "chaque iteration -- un thread separe calcule pendant que le GPU calcule sa "
                               "portion, gradients fusionnes ensuite. 0 pour desactiver (tout sur GPU).")
+    parser.add_argument("--dropout", type=float, default=0.1,
+                         help="Dropout3d au bottleneck (0.0 pour desactiver, comportement d'origine)")
+    parser.add_argument("--no-deep-supervision", action="store_false", dest="deep_supervision",
+                         help="desactive les pertes auxiliaires aux etages intermediaires du decodeur "
+                              "(actives par defaut)")
+    parser.add_argument("--aux-loss-weight", type=float, default=0.3,
+                         help="poids des pertes auxiliaires (deep supervision) dans la perte totale")
+    parser.add_argument("--lr-schedule", choices=["plateau", "cosine"], default="plateau",
+                         help="'plateau' = ReduceLROnPlateau (reduit si val_loss stagne), "
+                              "'cosine' = CosineAnnealingWarmRestarts (redemarrages periodiques, "
+                              "aide a s'echapper des plateaux/minima locaux)")
+    parser.add_argument("--model-name", default="heatmap_unet",
+                         help="nom du modele -- determine les fichiers de checkpoint "
+                              "(weights/<nom>.pt, <nom>_latest.pt, <nom>_swa.pt) et le log "
+                              "(train_log_<nom>.json). Utiliser des noms differents pour entrainer "
+                              "plusieurs modeles independants (ensemble).")
+    parser.add_argument("--seed", type=int, default=0,
+                         help="graine aleatoire -- varier entre modeles d'un meme ensemble pour "
+                              "obtenir une diversite utile (init des poids + ordre des augmentations)")
     args = parser.parse_args()
 
     run_training(
@@ -639,4 +699,7 @@ if __name__ == "__main__":
         gpu_duty_cycle=args.gpu_duty_cycle, cpu_parallel_fraction=args.cpu_parallel_fraction,
         weight_decay=args.weight_decay, lr_patience=args.lr_patience, lr_factor=args.lr_factor,
         grad_clip=args.grad_clip, swa_last_n=args.swa_last_n,
+        dropout=args.dropout, deep_supervision=args.deep_supervision,
+        aux_loss_weight=args.aux_loss_weight, lr_schedule=args.lr_schedule,
+        model_name=args.model_name, seed=args.seed,
     )
