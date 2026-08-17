@@ -26,6 +26,21 @@ Ce que le script fait tout seul, sans intervention manuelle :
   8. relancable a tout moment : reprend automatiquement depuis le dernier
      checkpoint plutot que de repartir de zero
 
+Techniques anti-plateau actives par defaut : weight_decay decouple, gradient
+clipping, augmentation avancee (flips/rotation/gamma/deformation elastique/
+bruit de Poisson), Stochastic Weight Averaging en fin d'entrainement, dropout
+au bottleneck, supervision profonde (pertes auxiliaires), et mining
+d'exemples difficiles (re-pondere le tirage vers les points les plus mal
+predits). Desactivables individuellement (voir --help). En option : LR
+schedule "cosine" (redemarrages periodiques, --lr-schedule cosine) et
+selection periodique du meilleur checkpoint sur la VRAIE metrique de
+competition plutot que sur val_loss seul (--real-score-every).
+
+--model-name permet d'entrainer plusieurs modeles independants (avec --seed
+different) pour constituer un ENSEMBLE a l'inference -- voir
+real_detect_dl.detect_dataset(model_names=(...)) qui moyenne les heatmaps
+predites par plusieurs modeles (et/ou plusieurs augmentations via tta=).
+
 Usage (defauts raisonnables pour un entrainement complet et automatique) :
     python src/train_detector.py
     python src/train_detector.py --patience 10 --num-workers 8   # reglages optionnels
@@ -52,6 +67,7 @@ WEIGHTS_DIR.mkdir(exist_ok=True)
 PATCH_SHAPE = (32, 64, 64)   # (Z, Y, X) -- divisible par 8 (3 niveaux de pooling)
 TARGET_SIGMA = (1.8, 4.0, 4.0)  # sigma (z,y,x) de la gaussienne cible, en voxels
 POS_WEIGHT = 25.0            # poids de la perte pres des centres annotes vs fond
+HARD_MINING_MOMENTUM = 0.9   # inertie de la moyenne mobile de difficulte par point (mining d'exemples difficiles)
 
 # protection thermique : un GPU portable qui tourne a 100% en continu sur de
 # longues sessions peut chauffer au point de crasher la machine (observe
@@ -205,8 +221,13 @@ class SparsePointPatchDataset(Dataset):
         if self.augment:
             patch, target = self._augment(patch, target)
 
+        # idx renvoye en plus de (patch, target) : necessaire pour le mining
+        # d'exemples difficiles (train_detector.py associe une perte
+        # observee a CET index precis pour ajuster sa probabilite de
+        # re-tirage) -- ignore partout ailleurs (val_loader, BN update SWA).
         return torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0), \
-            torch.from_numpy(np.ascontiguousarray(target)).unsqueeze(0)
+            torch.from_numpy(np.ascontiguousarray(target)).unsqueeze(0), \
+            idx
 
     @staticmethod
     def _augment(patch, target):
@@ -275,9 +296,16 @@ class SparsePointPatchDataset(Dataset):
         return np.clip(noisy, 0.0, 1.0)
 
 
-def weighted_mse_loss(pred, target, pos_weight=POS_WEIGHT):
+def weighted_mse_loss(pred, target, pos_weight=POS_WEIGHT, reduction="mean"):
+    """reduction="none" renvoie une perte par echantillon (moyennee sur les
+    dimensions spatiales, dim batch conservee) -- utilise pour le mining
+    d'exemples difficiles, qui a besoin de savoir QUEL echantillon du batch
+    est mal predit, pas seulement la moyenne du batch."""
     weight = 1.0 + (pos_weight - 1.0) * target
-    return (weight * (pred - target) ** 2).mean()
+    se = weight * (pred - target) ** 2
+    if reduction == "none":
+        return se.mean(dim=tuple(range(1, se.ndim)))
+    return se.mean()
 
 
 def compute_loss_with_aux(model, pred, target, aux_weight=0.3):
@@ -291,6 +319,52 @@ def compute_loss_with_aux(model, pred, target, aux_weight=0.3):
         aux_loss = sum(weighted_mse_loss(a, target) for a in aux_outputs) / len(aux_outputs)
         loss = loss + aux_weight * aux_loss
     return loss
+
+
+def _evaluate_real_score(model, model_name, val_names, device, n_datasets=2):
+    """Evalue la vraie metrique de competition (edge Jaccard + 0.1*division
+    Jaccard, voir multi_sample_evaluate.py) sur quelques datasets de
+    VALIDATION, avec l'etat EN MEMOIRE actuel du modele -- pas besoin de
+    sauvegarder sur disque puis recharger : on insere directement `model`
+    dans le cache de real_detect_dl.load_model() le temps de l'evaluation,
+    puis on restaure ce qui s'y trouvait avant (au cas ou un autre code
+    utiliserait aussi ce cache dans le meme process).
+
+    val_loss (MSE ponderee sur des points isoles) n'est qu'un proxy de ce qui
+    est note -- il ne capture ni le tracking ni les divisions. Ce controle
+    periodique, plus couteux (detection + tracking + calcul de la vraie
+    metrique sur des volumes entiers), verifie que les deux ne divergent pas
+    et permet de garder a part le checkpoint reellement le meilleur au sens
+    de la competition, qui peut differer du meilleur par val_loss.
+    """
+    import real_detect_dl
+    from multi_sample_evaluate import evaluate_dataset
+    from functools import partial
+    from config import DATA_DIR
+
+    cache_key = (model_name, device)
+    prev_cached = real_detect_dl._model_cache.get(cache_key)
+    real_detect_dl._model_cache[cache_key] = model
+    chosen = list(val_names[:n_datasets])
+    try:
+        detect_fn = partial(real_detect_dl.detect_dataset, model_names=(model_name,), device=device)
+        total_tp = total_fp = total_fn = 0
+        total_div_tp = total_div_fp = total_div_fn = 0
+        for name in chosen:
+            edge_m, div_m = evaluate_dataset(name, detect_fn)
+            total_tp += edge_m["edge_tp"]; total_fp += edge_m["edge_fp"]; total_fn += edge_m["edge_fn"]
+            total_div_tp += div_m["division_tp"]; total_div_fp += div_m["division_fp"]; total_div_fn += div_m["division_fn"]
+        edge_jaccard = total_tp / (total_tp + total_fp + total_fn) if (total_tp + total_fp + total_fn) else 0.0
+        div_jaccard = (total_div_tp / (total_div_tp + total_div_fp + total_div_fn)
+                       if (total_div_tp + total_div_fp + total_div_fn) else 0.0)
+        return edge_jaccard + 0.1 * div_jaccard
+    finally:
+        if prev_cached is not None:
+            real_detect_dl._model_cache[cache_key] = prev_cached
+        else:
+            real_detect_dl._model_cache.pop(cache_key, None)
+        for name in chosen:
+            (DATA_DIR / f"_tmp_{name}_submission.csv").unlink(missing_ok=True)
 
 
 def _count_epochs_since_best(history, best_val_loss, min_delta):
@@ -317,7 +391,9 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                   patience=6, min_delta=1e-5, gpu_duty_cycle=1.0, cpu_parallel_fraction=0.0,
                   weight_decay=1e-4, lr_patience=3, lr_factor=0.5, grad_clip=1.0, swa_last_n=5,
                   dropout=0.1, deep_supervision=True, aux_loss_weight=0.3,
-                  lr_schedule="plateau", model_name="heatmap_unet"):
+                  lr_schedule="plateau", model_name="heatmap_unet",
+                  hard_mining=True, hard_mining_start_epoch=3, hard_mining_power=1.0,
+                  real_score_every=0, real_score_datasets=2):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  num_workers: {num_workers}")
 
@@ -354,7 +430,28 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     if num_workers > 0:
         loader_kwargs.update(persistent_workers=True, prefetch_factor=4, pin_memory=(device == "cuda"))
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
+    # mining d'exemples difficiles : au lieu de tirer les patchs uniformement,
+    # on pondere le tirage par la perte recente observee sur chaque point
+    # (moyenne mobile) -- un WeightedRandomSampler dont les poids sont mis a
+    # jour a la fin de chaque epoque. Les points systematiquement mal predits
+    # (cellules qui se touchent, zones sombres...) sont alors revus plus
+    # souvent, sans qu'il soit besoin de les identifier a la main. Melange a
+    # 50% avec un poids uniforme pour ne pas negliger les points faciles
+    # (utiles a la regularisation) ni sur-ajuster sur quelques points
+    # bruites. sample_loss demarre a 1.0 (neutre) pour tous -- les vrais
+    # ecarts de difficulte n'emergent qu'apres quelques epoques
+    # (hard_mining_start_epoch retarde l'activation, le signal initial est
+    # trop bruite pour etre utile).
+    sample_loss = np.ones(len(train_ds), dtype=np.float64)
+    if hard_mining:
+        train_sampler = torch.utils.data.WeightedRandomSampler(
+            weights=torch.ones(len(train_ds), dtype=torch.double),
+            num_samples=len(train_ds), replacement=True,
+        )
+        train_loader = DataLoader(train_ds, batch_size=batch_size, sampler=train_sampler, **loader_kwargs)
+    else:
+        train_sampler = None
+        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs)
 
     model = HeatmapUNet3D(levels=DETECTOR_LEVELS, dropout=dropout, deep_supervision=deep_supervision).to(device)
@@ -421,6 +518,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     start_epoch = 0
     best_val_loss = float("inf")
     epochs_without_improvement = 0
+    # non restaure a la reprise (recalcule vite: quelques evaluations reelles
+    # suffisent a retrouver un ordre de grandeur correct) -- weights/<nom>_bestreal.pt
+    # sur disque garde neanmoins le meilleur checkpoint jamais vu sur le vrai score.
+    best_real_score = float("-inf")
 
     if resume and latest_path.exists():
         ckpt = torch.load(latest_path, map_location=device, weights_only=False)
@@ -461,10 +562,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         train_iter = iter(train_loader)
         for step in range(steps_per_epoch):
             try:
-                patch, target = next(train_iter)
+                patch, target, idx = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                patch, target = next(train_iter)
+                patch, target, idx = next(train_iter)
 
             step_t0 = time.time()
             batch_n = patch.shape[0]
@@ -492,6 +593,19 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             target_gpu = target[n_cpu:].to(device, non_blocking=True)
             pred = model(patch_gpu)
             loss = compute_loss_with_aux(model, pred, target_gpu, aux_loss_weight)
+
+            if train_sampler is not None:
+                # met a jour la difficulte observee (moyenne mobile) pour
+                # CHAQUE point du sous-batch GPU -- la portion CPU (si
+                # cpu_parallel_fraction>0) n'est pas trackee ici par
+                # simplicite, elle reste a poids neutre. Sans effet sur le
+                # gradient (juste de la comptabilite pour le prochain tirage).
+                with torch.no_grad():
+                    per_sample_loss = weighted_mse_loss(pred, target_gpu, reduction="none").cpu().numpy()
+                idx_gpu = idx[n_cpu:].numpy()
+                sample_loss[idx_gpu] = (
+                    HARD_MINING_MOMENTUM * sample_loss[idx_gpu] + (1 - HARD_MINING_MOMENTUM) * per_sample_loss
+                )
 
             optimizer.zero_grad()
             loss.backward()
@@ -539,7 +653,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         model.eval()
         val_losses = []
         with torch.no_grad():
-            for patch, target in val_loader:
+            for patch, target, _idx in val_loader:
                 patch, target = patch.to(device, non_blocking=True), target.to(device, non_blocking=True)
                 pred = model(patch)
                 val_losses.append(weighted_mse_loss(pred, target).item())
@@ -568,6 +682,41 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         else:
             epochs_without_improvement += 1
             print(f"  -> pas d'amelioration ({epochs_without_improvement}/{patience} avant arret automatique)")
+
+        if train_sampler is not None and (epoch + 1) >= hard_mining_start_epoch:
+            # repondere le tirage pour la prochaine epoque a partir de la
+            # difficulte observee (voir creation du sampler plus haut pour
+            # le detail du melange 50/50 avec un poids uniforme).
+            w = np.clip(sample_loss, 1e-6, None) ** hard_mining_power
+            w = 0.5 * (w / w.mean()) + 0.5
+            train_sampler.weights = torch.as_tensor(w, dtype=torch.double)
+
+        if real_score_every and (epoch + 1) % real_score_every == 0:
+            # controle periodique, plus couteux (detection + tracking sur des
+            # volumes entiers) : verifie que val_loss (proxy) et la vraie
+            # metrique de competition restent alignees, et garde a part le
+            # meilleur checkpoint au sens de CETTE metrique.
+            eval_t0 = time.time()
+            was_training = model.training
+            model.eval()
+            try:
+                real_score = _evaluate_real_score(model, model_name, val_names, device, n_datasets=real_score_datasets)
+            except Exception as exc:
+                print(f"  (evaluation du vrai score echouee, ignoree: {exc})")
+                real_score = None
+            if was_training:
+                model.train()
+            if real_score is not None:
+                history[-1]["real_score"] = real_score
+                if real_score > best_real_score:
+                    best_real_score = real_score
+                    bestreal_path = WEIGHTS_DIR / f"{model_name}_bestreal.pt"
+                    torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "real_score": real_score}, bestreal_path)
+                    print(f"  -> vrai score = {real_score:.4f} ({time.time() - eval_t0:.1f}s) : NOUVEAU MEILLEUR "
+                          f"(par score reel), sauvegarde: {bestreal_path}")
+                else:
+                    print(f"  -> vrai score = {real_score:.4f} ({time.time() - eval_t0:.1f}s)  "
+                          f"(meilleur reel actuel: {best_real_score:.4f})")
 
         log_path.write_text(json.dumps(history, indent=2))
 
@@ -612,7 +761,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             bn_update_iter = iter(train_loader)
             for _ in range(30):
                 try:
-                    bn_patch, _ = next(bn_update_iter)
+                    bn_patch, _, _idx = next(bn_update_iter)
                 except StopIteration:
                     break
                 swa_model(bn_patch.to(device))
@@ -620,7 +769,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         swa_model.eval()
         swa_val_losses = []
         with torch.no_grad():
-            for patch, target in val_loader:
+            for patch, target, _idx in val_loader:
                 patch, target = patch.to(device, non_blocking=True), target.to(device, non_blocking=True)
                 pred = swa_model(patch)
                 swa_val_losses.append(weighted_mse_loss(pred, target).item())
@@ -689,6 +838,23 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0,
                          help="graine aleatoire -- varier entre modeles d'un meme ensemble pour "
                               "obtenir une diversite utile (init des poids + ordre des augmentations)")
+    parser.add_argument("--no-hard-mining", action="store_false", dest="hard_mining",
+                         help="desactive le mining d'exemples difficiles (tirage uniforme classique, "
+                              "actif par defaut)")
+    parser.add_argument("--hard-mining-start-epoch", type=int, default=3,
+                         help="n'ajuste le tirage qu'a partir de cette epoque -- le signal de "
+                              "difficulte des toutes premieres epoques est trop bruite pour etre utile")
+    parser.add_argument("--hard-mining-power", type=float, default=1.0,
+                         help="exposant applique a la difficulte observee avant normalisation -- "
+                              "plus grand = concentre davantage le tirage sur les points les plus durs")
+    parser.add_argument("--real-score-every", type=int, default=0,
+                         help="toutes les N epoques, evalue la VRAIE metrique de competition "
+                              "(detection+tracking+jaccard sur des datasets de validation entiers, "
+                              "plus couteux que val_loss) et garde a part le meilleur checkpoint selon "
+                              "ce score reel (weights/<nom>_bestreal.pt). 0 pour desactiver (defaut).")
+    parser.add_argument("--real-score-datasets", type=int, default=2,
+                         help="nombre de datasets de validation utilises pour l'evaluation periodique "
+                              "du vrai score (plus = plus fiable mais plus lent)")
     args = parser.parse_args()
 
     run_training(
@@ -702,4 +868,7 @@ if __name__ == "__main__":
         dropout=args.dropout, deep_supervision=args.deep_supervision,
         aux_loss_weight=args.aux_loss_weight, lr_schedule=args.lr_schedule,
         model_name=args.model_name, seed=args.seed,
+        hard_mining=args.hard_mining, hard_mining_start_epoch=args.hard_mining_start_epoch,
+        hard_mining_power=args.hard_mining_power,
+        real_score_every=args.real_score_every, real_score_datasets=args.real_score_datasets,
     )

@@ -16,25 +16,55 @@ import torch
 from skimage.feature import peak_local_max
 from real_io import open_zarr_volume
 from dl_model import HeatmapUNet3D, DETECTOR_LEVELS
-from config import ROOT, TRAIN_DIR, WEIGHTS_PATH
+from config import ROOT, TRAIN_DIR, WEIGHTS_DIR
 
 _model_cache = {}
 
+# combinaisons d'axes a inverser pour la Test-Time Augmentation (miroirs
+# uniquement -- pas de rotation Z<->Y/X car l'echelle physique differe selon
+# l'axe, une rotation changerait la geometrie reelle du volume) :
+#   "light" : identite + un seul miroir par axe (4 passes)
+#   "full"  : les 8 combinaisons possibles des 3 miroirs (8 passes)
+_TTA_LIGHT = [(), (0,), (1,), (2,)]
+_TTA_FULL = [(), (0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)]
 
-def load_model(device=None):
+
+def _tta_axes_list(tta):
+    if not tta:
+        return [()]
+    if tta == "light":
+        return _TTA_LIGHT
+    if tta == "full":
+        return _TTA_FULL
+    raise ValueError(f"tta invalide: {tta!r} (attendu None, 'light' ou 'full')")
+
+
+def load_model(model_name="heatmap_unet", device=None):
+    """Charge (avec cache) le checkpoint `weights/<model_name>.pt`.
+
+    Tolerant aux checkpoints entraines avec deep_supervision=True : les poids
+    des `aux_heads.*` (non utilises a l'inference, seule la sortie
+    principale sert) sont simplement ignores via strict=False plutot que de
+    faire planter le chargement.
+    """
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    if device not in _model_cache:
-        if not WEIGHTS_PATH.exists():
+    cache_key = (model_name, device)
+    if cache_key not in _model_cache:
+        weights_path = WEIGHTS_DIR / f"{model_name}.pt"
+        if not weights_path.exists():
             raise FileNotFoundError(
-                f"Aucun checkpoint entraine trouve a {WEIGHTS_PATH}.\n"
+                f"Aucun checkpoint entraine trouve a {weights_path}.\n"
                 f"  -> lance d'abord: python src/train_detector.py"
             )
         model = HeatmapUNet3D(levels=DETECTOR_LEVELS).to(device)
-        ckpt = torch.load(WEIGHTS_PATH, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt["model_state"])
+        ckpt = torch.load(weights_path, map_location=device, weights_only=False)
+        missing, unexpected = model.load_state_dict(ckpt["model_state"], strict=False)
+        unexpected = [k for k in unexpected if not k.startswith("aux_heads.")]
+        if missing or unexpected:
+            print(f"  (avertissement chargement '{model_name}': missing={missing}, unexpected={unexpected})")
         model.eval()
-        _model_cache[device] = model
-    return _model_cache[device]
+        _model_cache[cache_key] = model
+    return _model_cache[cache_key]
 
 
 def _pad_to_multiple(volume, multiple=8):
@@ -93,9 +123,36 @@ def refine_peak_subvoxel(heatmap, peak_zyx, window=2):
     return float(cz), float(cy), float(cx)
 
 
-def detect_dataset(zarr_path, min_distance=4, threshold_abs=0.3, subvoxel_refine=True, device=None, verbose=True):
+def _predict_heatmap(models, norm, device, axes_list):
+    """Moyenne les heatmaps predites sur tous les (modele x augmentation TTA).
+    Avec un seul modele et tta=None (axes_list=[()]), equivalent exact a
+    l'ancien chemin (une seule passe forward, aucune moyenne)."""
+    acc = None
+    n = 0
+    for model in models:
+        for axes in axes_list:
+            aug = np.ascontiguousarray(np.flip(norm, axis=axes)) if axes else norm
+            padded, pads = _pad_to_multiple(aug)
+            x = torch.from_numpy(padded).unsqueeze(0).unsqueeze(0).to(device)
+            heatmap = _run_model(model, x, device)
+            sl = tuple(slice(0, dim) for dim in aug.shape)
+            heatmap = heatmap[sl]
+            if axes:
+                heatmap = np.ascontiguousarray(np.flip(heatmap, axis=axes))
+            acc = heatmap if acc is None else acc + heatmap
+            n += 1
+    return acc / n
+
+
+def detect_dataset(zarr_path, min_distance=4, threshold_abs=0.3, subvoxel_refine=True, device=None,
+                    verbose=True, tta=None, model_names=("heatmap_unet",)):
+    """tta : None (desactive, comportement d'origine), "light" (4 passes,
+    miroirs simples) ou "full" (8 passes, toutes les combinaisons de miroirs).
+    model_names : un ou plusieurs noms de checkpoints (weights/<nom>.pt) --
+    en fournir plusieurs fait une moyenne d'ensemble des heatmaps predites."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model(device)
+    models = [load_model(name, device) for name in model_names]
+    axes_list = _tta_axes_list(tta)
 
     arr, scale_zyx, quantiles = open_zarr_volume(zarr_path)
     q_lo, q_hi = quantiles.get("0.1", 0.0), quantiles.get("0.999", 2000.0)
@@ -105,14 +162,7 @@ def detect_dataset(zarr_path, min_distance=4, threshold_abs=0.3, subvoxel_refine
     for t in range(T):
         frame = arr[t][:].astype(np.float32)
         norm = np.clip((frame - q_lo) / max(q_hi - q_lo, 1e-6), 0.0, 1.0)
-        padded, pads = _pad_to_multiple(norm)
-
-        x = torch.from_numpy(padded).unsqueeze(0).unsqueeze(0).to(device)
-        heatmap = _run_model(model, x, device)
-
-        # retire le padding avant la detection de pics
-        sl = tuple(slice(0, dim) for dim in norm.shape)
-        heatmap = heatmap[sl]
+        heatmap = _predict_heatmap(models, norm, device, axes_list)
 
         coords = peak_local_max(heatmap, min_distance=min_distance, threshold_abs=threshold_abs)
         for (z, y, x_) in coords:
