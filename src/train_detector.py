@@ -31,8 +31,9 @@ Usage (defauts raisonnables pour un entrainement complet et automatique) :
     python src/train_detector.py --patience 10 --num-workers 8   # reglages optionnels
 """
 
-import sys, json, time, argparse, random, subprocess, threading
+import sys, json, time, argparse, random, subprocess, threading, copy
 from pathlib import Path
+from collections import deque
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np
@@ -40,6 +41,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 from real_io import open_zarr_volume
 from dl_model import HeatmapUNet3D, DETECTOR_LEVELS
@@ -229,7 +231,48 @@ class SparsePointPatchDataset(Dataset):
         patch = np.clip(patch, 0, 1) ** gamma
         patch = np.clip(patch + np.random.uniform(-0.05, 0.05), 0.0, 1.0)
 
+        if np.random.rand() < 0.4:
+            patch, target = SparsePointPatchDataset._elastic_deform(patch, target)
+        if np.random.rand() < 0.3:
+            patch = SparsePointPatchDataset._poisson_noise(patch)
+
         return patch, target
+
+    @staticmethod
+    def _elastic_deform(patch, target, alpha=6.0, sigma=4.0):
+        """Deformation elastique : un champ de deplacement aleatoire lisse
+        (bruit gaussien flou = correlation spatiale realiste) est applique
+        IDENTIQUEMENT au patch et a la cible, donc la gaussienne-cible reste
+        alignee avec la cellule deformee sans recalcul de coordonnees.
+        Particulierement utile en imagerie biologique ou les cellules se
+        deforment naturellement (contrairement a une simple rotation/flip)."""
+        shape = patch.shape
+        # champ de deplacement brut, lisse par un flou gaussien (sigma=echelle
+        # spatiale de la deformation), puis mis a l'echelle par alpha (amplitude)
+        dz = gaussian_filter(np.random.randn(*shape).astype(np.float32), sigma) * alpha
+        dy = gaussian_filter(np.random.randn(*shape).astype(np.float32), sigma) * alpha
+        dx = gaussian_filter(np.random.randn(*shape).astype(np.float32), sigma) * alpha
+
+        zz, yy, xx = np.meshgrid(
+            np.arange(shape[0]), np.arange(shape[1]), np.arange(shape[2]), indexing="ij"
+        )
+        coords = [
+            np.clip(zz + dz, 0, shape[0] - 1),
+            np.clip(yy + dy, 0, shape[1] - 1),
+            np.clip(xx + dx, 0, shape[2] - 1),
+        ]
+        patch_deformed = map_coordinates(patch, coords, order=1, mode="reflect")
+        target_deformed = map_coordinates(target, coords, order=1, mode="constant", cval=0.0)
+        return patch_deformed.astype(np.float32), target_deformed.astype(np.float32)
+
+    @staticmethod
+    def _poisson_noise(patch, scale=60.0):
+        """Bruit de photon-comptage (Poisson), le modele de bruit realiste en
+        microscopie a fluorescence -- plus fort dans les zones sombres,
+        contrairement a un bruit gaussien additif uniforme."""
+        scaled = np.clip(patch, 0, 1) * scale
+        noisy = np.random.poisson(scaled).astype(np.float32) / scale
+        return np.clip(noisy, 0.0, 1.0)
 
 
 def weighted_mse_loss(pred, target, pos_weight=POS_WEIGHT):
@@ -256,10 +299,10 @@ def split_datasets(nodes_df, val_fraction=0.2, seed=0):
     return names[n_val:], names[:n_val]
 
 
-def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None, val_samples=400,
+def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None, val_samples=1000,
                   device=None, seed=0, num_workers=6, resume=True, save_every_steps=100,
                   patience=6, min_delta=1e-5, gpu_duty_cycle=1.0, cpu_parallel_fraction=0.0,
-                  weight_decay=1e-4):
+                  weight_decay=1e-4, lr_patience=3, lr_factor=0.5, grad_clip=1.0, swa_last_n=5):
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}  |  num_workers: {num_workers}")
 
@@ -313,6 +356,19 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     ], lr=lr)
     print(f"weight_decay={weight_decay} sur {len(decay_params)} tenseurs de poids "
           f"({len(no_decay_params)} tenseurs BatchNorm/biais exemptes)")
+
+    # reduit lr automatiquement quand val_loss stagne -- complement du
+    # weight_decay : celui-ci regularise, le scheduler affine la convergence
+    # une fois que les pas actuels sont trop grands pour progresser encore.
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=lr_factor, patience=lr_patience
+    )
+
+    # SWA (Stochastic Weight Averaging) : conserve les N derniers etats du
+    # modele (copies CPU, ~22 Mo chacune) pour les moyenner en fin
+    # d'entrainement -- souvent un gain "gratuit" de generalisation une fois
+    # proche du plateau, sans entrainement supplementaire.
+    swa_snapshots = deque(maxlen=swa_last_n) if swa_last_n and swa_last_n > 1 else None
 
     use_cpu_parallel = device == "cuda" and cpu_parallel_fraction and cpu_parallel_fraction > 0
     model_cpu = HeatmapUNet3D(levels=DETECTOR_LEVELS).to("cpu") if use_cpu_parallel else None
@@ -419,6 +475,13 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             else:
                 train_losses.append(loss.item())
 
+            if grad_clip and grad_clip > 0:
+                # empeche un gradient occasionnellement enorme (patch bruite,
+                # cellule saturee) de faire un pas destabilisant -- reduit le
+                # bruit observe dans les oscillations de val_loss d'une
+                # epoque a l'autre.
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
             optimizer.step()
 
             if gpu_duty_cycle and gpu_duty_cycle < 1.0 and device == "cuda":
@@ -470,11 +533,63 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
 
         log_path.write_text(json.dumps(history, indent=2))
 
+        if swa_snapshots is not None:
+            swa_snapshots.append(copy.deepcopy({k: v.cpu() for k, v in model.state_dict().items()}))
+
+        lr_before = optimizer.param_groups[0]["lr"]
+        scheduler.step(val_loss)
+        lr_after = optimizer.param_groups[0]["lr"]
+        if lr_after < lr_before:
+            print(f"  -> lr reduit: {lr_before:.2e} -> {lr_after:.2e} (val_loss stagne)")
+
         if epochs_without_improvement >= patience:
             print(f"\nArret automatique (early stopping) : pas d'amelioration depuis {patience} epoques.")
             break
     else:
         print(f"\nmax_epochs ({max_epochs}) atteint sans early stopping -- relance le script pour continuer.")
+
+    if swa_snapshots is not None and len(swa_snapshots) >= 2:
+        print(f"\nSWA : moyenne des {len(swa_snapshots)} derniers etats du modele...")
+        avg_state = {}
+        for k in swa_snapshots[0].keys():
+            stacked = torch.stack([sd[k].float() for sd in swa_snapshots], dim=0)
+            avg_state[k] = stacked.mean(dim=0)
+
+        swa_model = HeatmapUNet3D(levels=DETECTOR_LEVELS).to(device)
+        swa_model.load_state_dict(avg_state)
+
+        # une simple moyenne des poids rend les stats BatchNorm (running_mean/
+        # running_var) incoherentes -- il faut un passage avant (sans
+        # retropropagation) sur des donnees d'entrainement pour les recalculer,
+        # c'est l'etape "update_bn" standard de SWA.
+        for module in swa_model.modules():
+            if isinstance(module, nn.BatchNorm3d):
+                module.reset_running_stats()
+                module.momentum = None  # moyenne cumulative plutot qu'exponentielle
+        swa_model.train()
+        with torch.no_grad():
+            bn_update_iter = iter(train_loader)
+            for _ in range(30):
+                try:
+                    bn_patch, _ = next(bn_update_iter)
+                except StopIteration:
+                    break
+                swa_model(bn_patch.to(device))
+
+        swa_model.eval()
+        swa_val_losses = []
+        with torch.no_grad():
+            for patch, target in val_loader:
+                patch, target = patch.to(device, non_blocking=True), target.to(device, non_blocking=True)
+                pred = swa_model(patch)
+                swa_val_losses.append(weighted_mse_loss(pred, target).item())
+        swa_val_loss = float(np.mean(swa_val_losses)) if swa_val_losses else float("nan")
+
+        swa_path = WEIGHTS_DIR / "heatmap_unet_swa.pt"
+        torch.save({"model_state": swa_model.state_dict(), "val_loss": swa_val_loss}, swa_path)
+        verdict = "MEILLEUR que le modele classique" if swa_val_loss < best_val_loss else "pas meilleur, garde a titre de reference"
+        print(f"SWA val_loss={swa_val_loss:.5f}  (meilleur classique={best_val_loss:.5f}) -> {verdict}")
+        print(f"Sauvegarde: {swa_path}")
 
     print(f"Entrainement termine. Meilleur val_loss={best_val_loss:.5f}. Checkpoint: {weights_path}")
     return weights_path
@@ -494,8 +609,16 @@ if __name__ == "__main__":
     parser.add_argument("--weight-decay", type=float, default=1e-4,
                          help="regularisation L2 decouplee (AdamW), appliquee aux poids des convolutions "
                               "uniquement (pas BatchNorm/biais). 0 pour desactiver.")
+    parser.add_argument("--lr-patience", type=int, default=3, help="epoques sans amelioration avant reduction de lr")
+    parser.add_argument("--lr-factor", type=float, default=0.5, help="facteur de reduction de lr (0.5 = divise par 2)")
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="norme max des gradients (0 pour desactiver)")
+    parser.add_argument("--swa-last-n", type=int, default=5,
+                         help="moyenne des N derniers etats du modele en fin d'entrainement (Stochastic Weight "
+                              "Averaging). 0 ou 1 pour desactiver.")
     parser.add_argument("--max-datasets", type=int, default=None, help="limiter le nb de datasets (debug/demo -- omettre pour utiliser TOUTE la base)")
-    parser.add_argument("--val-samples", type=int, default=400, help="nb de points de validation (sous-echantillonne)")
+    parser.add_argument("--val-samples", type=int, default=1000,
+                         help="nb de points de validation (sous-echantillonne) -- augmente de 400 a 1000 pour un "
+                              "signal de plateau moins bruite")
     parser.add_argument("--num-workers", type=int, default=6, help="process paralleles pour charger les patchs")
     parser.add_argument("--no-resume", action="store_true", help="ignorer un checkpoint existant et repartir de zero")
     parser.add_argument("--save-every-steps", type=int, default=100, help="checkpoint de secours toutes les N iterations")
@@ -514,5 +637,6 @@ if __name__ == "__main__":
         num_workers=args.num_workers, resume=not args.no_resume,
         save_every_steps=args.save_every_steps, patience=args.patience,
         gpu_duty_cycle=args.gpu_duty_cycle, cpu_parallel_fraction=args.cpu_parallel_fraction,
-        weight_decay=args.weight_decay,
+        weight_decay=args.weight_decay, lr_patience=args.lr_patience, lr_factor=args.lr_factor,
+        grad_clip=args.grad_clip, swa_last_n=args.swa_last_n,
     )
