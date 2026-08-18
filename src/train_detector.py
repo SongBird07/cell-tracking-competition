@@ -768,56 +768,6 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         print("ATTENTION: use_sam=True desactive cpu_parallel_fraction (les deux ne sont pas combinables).")
         cpu_parallel_fraction = 0.0
 
-    # weight_decay contre le plateau (regularisation L2, decouplee -- AdamW) :
-    # applique seulement aux poids des convolutions, PAS aux parametres de
-    # BatchNorm/GroupNorm (gamma/beta) ni aux biais -- les decayer degrade
-    # generalement les performances (pratique standard).
-    decay_params, no_decay_params = [], []
-    for name, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
-        if p.ndim <= 1 or "bn" in name.lower() or "batchnorm" in name.lower():
-            no_decay_params.append(p)
-        else:
-            decay_params.append(p)
-    param_groups = [
-        {"params": decay_params, "weight_decay": weight_decay},
-        {"params": no_decay_params, "weight_decay": 0.0},
-    ]
-    if use_sam:
-        optimizer = SAM(param_groups, torch.optim.AdamW, rho=sam_rho, lr=lr)
-        print(f"SAM actif (rho={sam_rho}) -- deux forward/backward par step, cout ~x2.")
-    else:
-        optimizer = torch.optim.AdamW(param_groups, lr=lr)
-    print(f"weight_decay={weight_decay} sur {len(decay_params)} tenseurs de poids "
-          f"({len(no_decay_params)} tenseurs BatchNorm/biais exemptes)")
-
-    # reduit lr automatiquement quand val_loss stagne -- complement du
-    # weight_decay : celui-ci regularise, le scheduler affine la convergence
-    # une fois que les pas actuels sont trop grands pour progresser encore.
-    # "cosine" est une alternative qui remonte lr periodiquement (warm
-    # restarts) au lieu de seulement le reduire -- peut aider a s'echapper
-    # d'un minimum local pointu plutot que de s'y installer.
-    if lr_schedule == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
-        scheduler_needs_val_loss = False
-    else:
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=lr_factor, patience=lr_patience
-        )
-        scheduler_needs_val_loss = True
-
-    # SWA (Stochastic Weight Averaging) : conserve les N derniers etats du
-    # modele (copies CPU, ~22 Mo chacune) pour les moyenner en fin
-    # d'entrainement -- souvent un gain "gratuit" de generalisation une fois
-    # proche du plateau, sans entrainement supplementaire.
-    swa_snapshots = deque(maxlen=swa_last_n) if swa_last_n and swa_last_n > 1 else None
-
-    use_cpu_parallel = device == "cuda" and cpu_parallel_fraction and cpu_parallel_fraction > 0
-    model_cpu = HeatmapUNet3D(**arch_kwargs).to("cpu") if use_cpu_parallel else None
-    if use_cpu_parallel:
-        print(f"CPU en parallele actif: {cpu_parallel_fraction:.0%} du batch, en meme temps que le GPU (pas en alternance)")
-
     # model_name permet d'entrainer plusieurs modeles independants (seeds
     # differentes) sans qu'ils s'ecrasent -- utile pour constituer un
     # ensemble a l'inference (moyenne des predictions de plusieurs modeles).
@@ -831,16 +781,25 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     start_epoch = 0
     best_val_loss = float("inf")
     # reconstruit depuis le log a la reprise (comme best_val_loss) -- sert a
-    # calculer correctement epochs_without_improvement (voir plus bas, le
-    # compteur de patience reset desormais sur une amelioration de val_loss
-    # OU d'EMA). Le MODELE ema_model, lui, n'est pas restaure depuis
-    # l'ancien fichier _ema.pt (voir plus bas) -- seule cette valeur l'est.
+    # calculer correctement epochs_without_improvement (le compteur de
+    # patience reset sur une amelioration de val_loss OU d'EMA). Le MODELE
+    # ema_model, lui, n'est pas restaure depuis l'ancien fichier _ema.pt
+    # (voir plus bas) -- seule cette valeur l'est.
     best_ema_val_loss = float("inf")
     epochs_without_improvement = 0
     # non restaure a la reprise (recalcule vite: quelques evaluations reelles
     # suffisent a retrouver un ordre de grandeur correct) -- weights/<nom>_bestreal.pt
     # sur disque garde neanmoins le meilleur checkpoint jamais vu sur le vrai score.
     best_real_score = float("-inf")
+    # lr restaure depuis le checkpoint si on reprend -- CRITIQUE : sans ca,
+    # un resume repart TOUJOURS de --lr (1e-3 par defaut), meme si le
+    # scheduler avait deja fait chuter le lr bien plus bas au fil des
+    # epoques precedentes. Un modele deja bien converge qui recoit d'un coup
+    # un lr 10-100x trop grand peut regresser catastrophiquement en une
+    # seule epoque (observe en pratique : val_loss multiplie par ~3 des la
+    # premiere epoque post-resume avec --lr-schedule cosine, qui en plus
+    # remonte periodiquement a ce lr trop eleve a chaque redemarrage).
+    resumed_lr = None
 
     if resume and latest_path.exists():
         ckpt = torch.load(latest_path, map_location=device, weights_only=False)
@@ -859,6 +818,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             ckpt = None
         if ckpt is not None:
             start_epoch = ckpt.get("epoch", 0)
+            resumed_lr = ckpt.get("lr")
             print(f"Reprise depuis {latest_path} (epoque {start_epoch} deja effectuee)")
             if log_path.exists():
                 history = json.loads(log_path.read_text())
@@ -882,6 +842,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
         if ckpt is not None:
             start_epoch = ckpt.get("epoch", 0)
             best_val_loss = ckpt.get("val_loss", float("inf"))
+            resumed_lr = ckpt.get("lr")
             print(f"Reprise depuis {weights_path} (epoque {start_epoch} deja effectuee, meilleur val_loss={best_val_loss:.5f})")
             if log_path.exists():
                 history = json.loads(log_path.read_text())
@@ -890,16 +851,75 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                                          default=float("inf"))
                 epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss)
 
+    effective_lr = resumed_lr if resumed_lr is not None else lr
+    if resumed_lr is not None:
+        print(f"lr restaure depuis le checkpoint: {effective_lr:.2e} (au lieu de --lr={lr:.2e}) -- "
+              f"evite une remontee brutale qui casserait un modele deja converge.")
+
+    # weight_decay contre le plateau (regularisation L2, decouplee -- AdamW) :
+    # applique seulement aux poids des convolutions, PAS aux parametres de
+    # BatchNorm/GroupNorm (gamma/beta) ni aux biais -- les decayer degrade
+    # generalement les performances (pratique standard).
+    decay_params, no_decay_params = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim <= 1 or "bn" in name.lower() or "batchnorm" in name.lower():
+            no_decay_params.append(p)
+        else:
+            decay_params.append(p)
+    param_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": no_decay_params, "weight_decay": 0.0},
+    ]
+    if use_sam:
+        optimizer = SAM(param_groups, torch.optim.AdamW, rho=sam_rho, lr=effective_lr)
+        print(f"SAM actif (rho={sam_rho}) -- deux forward/backward par step, cout ~x2.")
+    else:
+        optimizer = torch.optim.AdamW(param_groups, lr=effective_lr)
+    print(f"weight_decay={weight_decay} sur {len(decay_params)} tenseurs de poids "
+          f"({len(no_decay_params)} tenseurs BatchNorm/biais exemptes)")
+
+    # reduit lr automatiquement quand val_loss stagne -- complement du
+    # weight_decay : celui-ci regularise, le scheduler affine la convergence
+    # une fois que les pas actuels sont trop grands pour progresser encore.
+    # "cosine" est une alternative qui remonte lr periodiquement (warm
+    # restarts) au lieu de seulement le reduire -- peut aider a s'echapper
+    # d'un minimum local pointu plutot que de s'y installer. Construit APRES
+    # la restauration de effective_lr : CosineAnnealingWarmRestarts fixe son
+    # "sommet" de redemarrage (base_lrs) au lr de l'optimizer AU MOMENT DE
+    # SA CONSTRUCTION -- s'il etait construit avant la restauration, chaque
+    # redemarrage remonterait quand meme a l'ancien --lr.
+    if lr_schedule == "cosine":
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2)
+        scheduler_needs_val_loss = False
+    else:
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=lr_factor, patience=lr_patience
+        )
+        scheduler_needs_val_loss = True
+
+    # SWA (Stochastic Weight Averaging) : conserve les N derniers etats du
+    # modele (copies CPU, ~22 Mo chacune) pour les moyenner en fin
+    # d'entrainement -- souvent un gain "gratuit" de generalisation une fois
+    # proche du plateau, sans entrainement supplementaire.
+    swa_snapshots = deque(maxlen=swa_last_n) if swa_last_n and swa_last_n > 1 else None
+
+    use_cpu_parallel = device == "cuda" and cpu_parallel_fraction and cpu_parallel_fraction > 0
+    model_cpu = HeatmapUNet3D(**arch_kwargs).to("cpu") if use_cpu_parallel else None
+    if use_cpu_parallel:
+        print(f"CPU en parallele actif: {cpu_parallel_fraction:.0%} du batch, en meme temps que le GPU (pas en alternance)")
+
     # EMA (moyenne mobile continue, voir _update_ema) : le MODELE est
     # initialise a partir de l'etat COURANT du modele (donc APRES la reprise
     # ci-dessus, resumed ou non) -- non restaure depuis un ancien fichier
     # _ema.pt (se reaccumule vite depuis ce point de depart, meme
     # simplification que best_real_score plus haut). best_ema_val_loss (la
-    # VALEUR, pour les comparaisons "meilleur jusqu'ici"), en revanche, EST
-    # reconstruite depuis le log ci-dessus.
+    # VALEUR, pour les comparaisons "meilleur jusqu'ici") a deja ete
+    # reconstruite depuis le log plus haut -- surtout ne PAS la reinitialiser
+    # ici (ecraserait la reconstruction, bug corrige).
     use_ema = ema_decay and ema_decay > 0
     ema_model = None
-    best_ema_val_loss = float("inf")
     if use_ema:
         ema_model = HeatmapUNet3D(**arch_kwargs).to(device)
         ema_model.load_state_dict(model.state_dict())
@@ -1053,7 +1073,8 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
 
             if save_every_steps and (step + 1) % save_every_steps == 0:
                 torch.save({"model_state": model.state_dict(), "epoch": epoch,
-                            "step_in_epoch": step + 1, "norm_type": norm_type}, latest_path)
+                            "step_in_epoch": step + 1, "norm_type": norm_type,
+                            "lr": optimizer.param_groups[0]["lr"]}, latest_path)
 
             if device == "cuda" and (step + 1) % GPU_TEMP_CHECK_EVERY_STEPS == 0:
                 cooldown_if_too_hot()
@@ -1081,9 +1102,11 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
               f"({elapsed:.1f}s)  {best_info}")
         history.append({"epoch": epoch + 1, "train_loss": train_loss, "val_loss": val_loss, "seconds": elapsed})
 
-        # checkpoint "dernier etat" (toujours ecrase, pour reprise apres crash)
+        # checkpoint "dernier etat" (toujours ecrase, pour reprise apres crash) --
+        # "lr" persiste le lr EN COURS pour que le prochain resume reparte
+        # exactement d'ici, pas de --lr par defaut (voir plus haut).
         torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss,
-                    "norm_type": norm_type}, latest_path)
+                    "norm_type": norm_type, "lr": optimizer.param_groups[0]["lr"]}, latest_path)
 
         # val_improved/ema_improved decident ENSEMBLE du reset du compteur de
         # patience (voir plus bas) -- avant, seule une amelioration de
@@ -1095,7 +1118,7 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
             improvement_str = f"amelioration de {best_val_loss - val_loss:.5f}" if best_val_loss != float("inf") else "premier resultat"
             best_val_loss = val_loss
             torch.save({"model_state": model.state_dict(), "epoch": epoch + 1, "val_loss": val_loss,
-                        "norm_type": norm_type}, weights_path)
+                        "norm_type": norm_type, "lr": optimizer.param_groups[0]["lr"]}, weights_path)
             print(f"  -> NOUVEAU MEILLEUR ({improvement_str}), checkpoint sauvegarde: {weights_path}")
         else:
             print(f"  -> pas d'amelioration (val_loss)")
