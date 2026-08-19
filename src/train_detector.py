@@ -633,11 +633,11 @@ def _load_state_dict_resumable(model, state_dict):
         print(f"  (reprise partielle -- cles manquantes={missing}, inattendues={unexpected})")
 
 
-def _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss=None):
+def _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss=None, best_real_score=None):
     """Reconstruit le compteur 'epoques sans amelioration' a partir du log,
     pour que l'early stopping reste coherent apres une reprise (resume).
-    S'arrete a la derniere epoque ou soit val_loss, soit ema_val_loss (si
-    fourni) etait a son meilleur -- coherent avec le reset combine du
+    S'arrete a la derniere epoque ou val_loss, ema_val_loss OU real_score
+    (ceux fournis) etait a son meilleur -- coherent avec le reset combine du
     compteur pendant l'entrainement (voir run_training)."""
     count = 0
     for h in reversed(history):
@@ -645,7 +645,10 @@ def _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_los
         ema_val = h.get("ema_val_loss")
         ema_ok = (best_ema_val_loss is not None and ema_val is not None
                   and ema_val == ema_val and ema_val <= best_ema_val_loss + min_delta)
-        if val_ok or ema_ok:
+        real_score = h.get("real_score")
+        real_ok = (best_real_score is not None and real_score is not None
+                   and real_score == real_score and real_score >= best_real_score - min_delta)
+        if val_ok or ema_ok or real_ok:
             break
         count += 1
     return count
@@ -787,9 +790,13 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
     # (voir plus bas) -- seule cette valeur l'est.
     best_ema_val_loss = float("inf")
     epochs_without_improvement = 0
-    # non restaure a la reprise (recalcule vite: quelques evaluations reelles
-    # suffisent a retrouver un ordre de grandeur correct) -- weights/<nom>_bestreal.pt
-    # sur disque garde neanmoins le meilleur checkpoint jamais vu sur le vrai score.
+    # reconstruit depuis le log a la reprise (comme best_val_loss/best_ema_val_loss) --
+    # SANS ca, un resume repart de -inf et la PREMIERE evaluation du vrai
+    # score de cette reprise est trivialement "meilleure", ecrasant
+    # weights/<nom>_bestreal.pt meme si elle est en realite pire que le
+    # meilleur score deja atteint avant la reprise (bug corrige : observe en
+    # pratique, un score reel INFERIEUR au precedent avait ete accepte comme
+    # "NOUVEAU MEILLEUR" juste apres un resume).
     best_real_score = float("-inf")
     # lr restaure depuis le checkpoint si on reprend -- CRITIQUE : sans ca,
     # un resume repart TOUJOURS de --lr (1e-3 par defaut), meme si le
@@ -826,7 +833,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 best_ema_val_loss = min((h["ema_val_loss"] for h in history
                                           if h.get("ema_val_loss") is not None and h["ema_val_loss"] == h["ema_val_loss"]),
                                          default=float("inf"))
-                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss)
+                best_real_score = max((h["real_score"] for h in history
+                                        if h.get("real_score") is not None and h["real_score"] == h["real_score"]),
+                                       default=float("-inf"))
+                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss, best_real_score)
     elif resume and weights_path.exists():
         ckpt = torch.load(weights_path, map_location=device, weights_only=False)
         ckpt_norm_type = ckpt.get("norm_type", "batch")
@@ -849,7 +859,10 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                 best_ema_val_loss = min((h["ema_val_loss"] for h in history
                                           if h.get("ema_val_loss") is not None and h["ema_val_loss"] == h["ema_val_loss"]),
                                          default=float("inf"))
-                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss)
+                best_real_score = max((h["real_score"] for h in history
+                                        if h.get("real_score") is not None and h["real_score"] == h["real_score"]),
+                                       default=float("-inf"))
+                epochs_without_improvement = _count_epochs_since_best(history, best_val_loss, min_delta, best_ema_val_loss, best_real_score)
 
     effective_lr = resumed_lr if resumed_lr is not None else lr
     if resumed_lr is not None:
@@ -1193,6 +1206,13 @@ def run_training(max_epochs, steps_per_epoch, batch_size, lr, max_datasets=None,
                                 "norm_type": norm_type}, bestreal_path)
                     print(f"  -> vrai score = {real_score:.4f} ({time.time() - eval_t0:.1f}s) : NOUVEAU MEILLEUR "
                           f"(par score reel), sauvegarde: {bestreal_path}")
+                    # une amelioration du VRAI score (la metrique qui compte
+                    # reellement, pas juste son proxy val_loss) reset aussi
+                    # la patience -- meme si val_loss/EMA stagnaient ce
+                    # tour-ci, le progres est reel.
+                    if epochs_without_improvement != 0:
+                        epochs_without_improvement = 0
+                        print(f"  -> compteur de patience reset (amelioration du vrai score)")
                 else:
                     print(f"  -> vrai score = {real_score:.4f} ({time.time() - eval_t0:.1f}s)  "
                           f"(meilleur reel actuel: {best_real_score:.4f})")
